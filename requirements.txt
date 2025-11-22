@@ -1,0 +1,6 @@
+numpy
+librosa
+soundfile
+pyserial
+requests
+beautifulsoup4
