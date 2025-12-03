@@ -1,43 +1,25 @@
 # Closed Captioning — GUI Usage
 
-This repository provides a live closed-captioning application that can run from a graphical interface (`gui.py`) or from the original command-line scripts (`main.py`, `voice_profiles.py`). This README combines the previous usage docs and updates the primary workflow to use the GUI.
+This repository provides a live closed-captioning application that can run from a graphical interface (`VAICCS.exe`) 
 
 **Quick overview**
 - Real-time captioning using Vosk for on-device speech recognition (optional).
 - Audio capture via `sounddevice` (microphone or system loopback on Windows).
-- A `gui.py` application exposes controls for starting/stopping captioning, selecting a Vosk model, choosing audio devices, serial output, and a "Voice Profiles" tab for creating/listing profiles.
+- A `VAICCS.exe` application exposes controls for starting/stopping captioning, selecting a Vosk model, choosing audio devices, serial output, and a "Voice Profiles" tab for creating/listing profiles.
 
-**Why use the GUI?**
+**Why use my GUI?**
 - Easier model selection and device selection.
 - Serial output configuration and quick toggles for common options.
 - Built-in voice profile creation and listing without using the CLI.
 
 # Closed Captioning — GUI Guide
 
-This repository offers a live closed-captioning application with a user-friendly GUI (`gui.py`). The GUI bundles model selection, audio device controls, serial output, and voice-profile management so you can run and configure captioning without using the CLI.
+This repository offers a live closed-captioning application with a user-friendly GUI (`VAICCS.exe`). The GUI bundles model selection, audio device controls, serial output, and voice-profile management so you can run and configure captioning without using the CLI.
 
 **Quick Overview**
-- **Real-time captioning**: on-device speech recognition via `vosk` (optional) or demo mode.
+- **Real-time captioning**: on-device speech recognition via `vosk` or demo mode.
 - **Audio capture**: uses `sounddevice` (microphone or loopback on Windows).
-- **Profiles**: create and match speaker profiles using the GUI (powered by `voice_profiles.py`).
-
-## Quick Start
-
-1. Create and activate a virtual environment (PowerShell):
-
-```powershell
-python -m venv .venv; .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-2. Run the GUI from the project root:
-
-```powershell
-python .\gui.py
-```
-
-3. Use the GUI to: select a Vosk model (optional), pick an audio input, and press **Start** to begin captioning.
+- **Profiles**: create and match speaker profiles using the GUI.
 
 ## GUI Features
 
@@ -56,13 +38,12 @@ python .\gui.py
 	- **Preview**: Options shows a live preview of how a sample phrase (e.g. `badword mother-in-law`) will be transformed by the selected settings.
 
 	These settings are applied immediately to the running engine when you press **OK** in the Options dialog and are persisted when you use **File → Save Settings As...**.
-	When you save settings via Save As, a copy is also written to `gui_settings.json` in the project folder so the GUI can pick up a sensible default on next launch.
 
 	Saved JSON keys related to these options include: `bleep_mode`, `bleep_custom_text`, and `bleep_mask_char`.
 
 - GUI tips:
 - Use the **Browse...** button next to the Vosk model field to point to a model directory.
-- If a model is already downloaded (marked with a ✓) in the Vosk Model Manager, you can now press **Select Installed** or double-click the model to set it as the active model in the GUI. This will populate the Vosk Model path field and update the status.
+- If a model is already downloaded (marked with a ✓) in the Vosk Model Manager, you can press **Select Installed** or double-click the model to set it as the active model in the GUI. This will populate the Vosk Model path field and update the status.
 - If a model is not available or `vosk` is not installed, the GUI offers a demo mode to test capture and display.
 - For consistent results on Windows, pick the correct loopback or microphone device from the Audio Input dropdown.
 
@@ -79,13 +60,10 @@ Aim for 5–15 seconds per clip.
 Shorter clips (<3s) often don’t provide enough acoustic detail.
 Longer clips (>30s) are fine, but you can break them into smaller segments for more embeddings.
 
- # VAICCS — GUI (VAICCS.exe)
-
-This document describes the graphical user interface provided by the VAICCS application (built from `launcher.py` / `gui.spec`). It focuses only on the features and UX of the GUI executable — not command-line tools.
 
 ## What VAICCS.exe Provides
 
-- Real-time closed captioning using an optional Vosk model (on-device speech recognition).
+- Real-time closed captioning using a Vosk model (on-device speech recognition).
 - Audio capture via `sounddevice` (microphone or Windows loopback).
 - Transcript terminal with auto-scroll, clear, and save controls.
 - Model selection and download manager (install Vosk models into the app's `models/` folder).
@@ -94,26 +72,8 @@ This document describes the graphical user interface provided by the VAICCS appl
 - Runtime custom vocabulary manager (Add words and sample audio to bias recognition).
 - Serial output support: export caption text to a serial device (configurable COM port and baud).
 - Profanity filtering with configurable replacement modes (fixed text, keep first/last letters, remove, etc.) and live preview.
-- Settings persistence via `gui_settings.json` (when using the GUI Save Settings option).
-- A small launcher that displays a splash screen at startup, keeps it visible at least 3 seconds, and loads the GUI in the background for faster perceived startup.
+- Settings persistence when using the GUI Save Settings option.
 
-## Quick Start (GUI)
-
-1. Create and activate a virtual environment (PowerShell):
-
-```powershell
-python -m venv .venv; .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-2. Run the GUI from the project root (during development):
-
-```powershell
-python .\launcher.py
-```
-
-3. Or run the packaged GUI executable `VAICCS.exe` from the `dist` folder after building with PyInstaller.
 
 Once running, use the Main tab to select an audio device and a Vosk model (optional), then press **Start** to begin captioning.
 
@@ -131,7 +91,7 @@ Examples (Windows Shortcut Target):
 
 `"C:\\Program Files\\VAICCS\\VAICCS.exe" -save:"settings.json" -autostart:true -show_error`
 
-`"C:\\Program Files\\VAICCS\\VAICCS.exe" -save:"C:\\Users\\Domin\\OneDrive\\settings.json" -autostart`
+`"C:\\Program Files\\VAICCS\\VAICCS.exe" -save:"C:\\Users\\User\\Desktop\\settings.json" -autostart`
 
 Notes about `-save` path resolution:
 - If a relative filename is provided (no drive or leading slash), the launcher searches in this order and uses the first match:
@@ -141,8 +101,8 @@ Notes about `-save` path resolution:
 
 ## Settings & Persistence
 
-- Use **File → Save Settings As...** to export the current GUI configuration to a JSON file. The GUI also writes `gui_settings.json` locally to remember a sensible default on next launch.
-- Saved options include model path, CPU threads, serial port, profile matching, and profanity replacement settings.
+- Use **File → Save Settings As...** to export the current GUI configuration to a JSON file. 
+- Saved options include model path, CPU threads, serial port, profile matching, profanity replacement settings, and other settings.
 
 ## Voice Profiles (GUI)
 
@@ -154,7 +114,7 @@ Notes about `-save` path resolution:
 - To use real recognition, download a compatible Vosk model and point the GUI to the unpacked model directory.
 - If `vosk` or native dependencies are not available, the GUI can run in demo mode so you can still test audio capture and UI features.
 
-Note: by default, the GUI installs Vosk models into a `models/` folder located next to the application root. When you run `gui.py` or `launcher.py` from the project folder (e.g., in VS Code), the app will prefer the project folder as the application root and create/use `./models/`. For packaged builds the models are installed next to the EXE. You can override this behavior with the `VAICCS_MODELS_ROOT` or `VOSK_MODELS_ROOT` environment variables.
+Note: by default, the GUI installs Vosk models into a `models/` folder located next to the application root.
 
 ## Troubleshooting
 
@@ -162,20 +122,8 @@ Note: by default, the GUI installs Vosk models into a `models/` folder located n
 - Use the `-show_error` modifier in the shortcut to have the launcher display the log contents in a dialog during startup.
 - Common causes: missing native libraries or incompatible Vosk wheel for the target platform. Rebuilding with an appropriate environment (or installing the matching redistributables) usually resolves the issue.
 
-## Building the GUI Executable (PyInstaller)
-
-- The included `gui.spec` is configured to use `launcher.py` as the entry point and attempts to collect Vosk dynamic libraries. Typical build command:
-
-```powershell
-pyinstaller --noconfirm gui.spec
-```
-
-After building, the `dist\VAICCS` directory will contain `VAICCS.exe` (the launcher + GUI).
-
-If you want an icon or additional data files bundled, add them via the spec `datas` or pass `--add-data` / `--icon` on the `pyinstaller` command line.
-
 ---
-Updated: 2025-11-21
+Updated: 2025-12-3
 
 Maintainer: Dominic Natoli
 
