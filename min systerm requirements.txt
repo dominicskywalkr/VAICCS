@@ -1,0 +1,11 @@
+Windows 11 
+Windows 10 (x64 only)
+
+Windows Server 2025
+Windows Server 2022
+Windows Server 2019
+Windows Server 2016
+
+
+4 core CPU or better
+16 GB of DDR4 RAM or faster

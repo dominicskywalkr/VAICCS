@@ -4,8 +4,47 @@ import time
 import sys
 import os
 from gui_splash import Splash
+# read license state to annotate splash title
+try:
+    import license_manager
+    _lic_type = ''
+    try:
+        # if there's a saved license and we have a pubkey, validate it offline
+        pub = os.environ.get('CRYPTOLENS_RSA_PUBKEY', '')
+        if not pub:
+            # try local config file like activate.py
+            try:
+                base = os.path.abspath(os.path.dirname(__file__))
+                cfg = os.path.join(base, 'cryptolens_config.json')
+                if os.path.exists(cfg):
+                    import json
+                    with open(cfg, 'r', encoding='utf-8') as f:
+                        j = json.load(f)
+                    pub = j.get('rsa_pubkey', '') or pub
+            except Exception:
+                pass
+
+        if pub:
+            try:
+                ok, msg = license_manager.validate_saved_license(pub, v=2)
+                if ok:
+                    _lic_type = 'commercial' if license_manager.license_type() == 'commercial' else ''
+                else:
+                    # fallback to license_type (may be stale)
+                    _lic_type = license_manager.license_type()
+            except Exception:
+                _lic_type = license_manager.license_type()
+        else:
+            _lic_type = license_manager.license_type()
+    except Exception:
+        _lic_type = license_manager.license_type()
+except Exception:
+    _lic_type = ''
 from startup_options import parse_modifiers, apply_startup_options
 import tkinter.messagebox as messagebox
+import threading
+import time
+import json
 
 # Importer thread will import the heavy GUI module
 info = {}
@@ -34,7 +73,12 @@ root = tk.Tk()
 # keep root withdrawn; Splash will center on screen when parent not mapped
 root.withdraw()
 
-splash = Splash(root, title_text="VAICCS", creator="Dominic Natoli")
+# Default to personal/evaluation unless we detect a commercial license
+splash_title = "VAICCS (Personal/eval)"
+if _lic_type == 'commercial':
+    splash_title = "VAICCS (Commercial)"
+
+splash = Splash(root, title_text=splash_title, creator="Dominic Natoli")
 try:
     splash.update_status("Loading application modules...")
 except Exception:
@@ -125,6 +169,101 @@ def check():
                 # apply startup options (load settings, autostart)
                 try:
                     apply_startup_options(app, options)
+                except Exception:
+                    pass
+                # Start background revalidation thread (attempt online re-checks)
+                try:
+                    def revalidate_loop(app_ref):
+                        """Background thread: attempt online revalidation of saved license.
+
+                        - On failure, retries every 5 minutes until success.
+                        - After success, sleeps 24 hours between revalidations.
+                        """
+                        SHORT_INTERVAL = 5 * 60
+                        LONG_INTERVAL = 24 * 3600
+                        while True:
+                            try:
+                                # load saved license and product key
+                                try:
+                                    data = license_manager.load_license()
+                                except Exception:
+                                    data = {}
+                                product_key = data.get('product_key')
+                                if not product_key:
+                                    # nothing to revalidate
+                                    return
+
+                                # load cryptolens config (env or config file)
+                                token = os.environ.get('CRYPTOLENS_TOKEN', '')
+                                rsa_pub = os.environ.get('CRYPTOLENS_RSA_PUBKEY', '')
+                                product_id = os.environ.get('CRYPTOLENS_PRODUCT_ID', '')
+                                if not (token and rsa_pub and product_id):
+                                    # try config file
+                                    try:
+                                        base = os.path.abspath(os.path.dirname(__file__))
+                                        cfg = os.path.join(base, 'cryptolens_config.json')
+                                        if os.path.exists(cfg):
+                                            with open(cfg, 'r', encoding='utf-8') as f:
+                                                j = json.load(f)
+                                            token = token or j.get('token', '')
+                                            rsa_pub = rsa_pub or j.get('rsa_pubkey', '')
+                                            product_id = product_id or str(j.get('product_id', ''))
+                                    except Exception:
+                                        pass
+
+                                if not (token and rsa_pub and product_id):
+                                    # cannot perform online revalidation
+                                    return
+
+                                # attempt online activation
+                                try:
+                                    from licensing.methods import Key, Helpers
+                                except Exception:
+                                    # licensing SDK not available
+                                    return
+
+                                try:
+                                    mc = Helpers.GetMachineCode(v=2)
+                                except Exception:
+                                    mc = None
+
+                                try:
+                                    result = Key.activate(token=token, rsa_pub_key=rsa_pub, product_id=int(product_id), key=product_key, machine_code=mc)
+                                except Exception:
+                                    result = None
+
+                                if result and result[0] is not None:
+                                    # successful revalidation; save fresh SKM and data
+                                    lk = result[0]
+                                    try:
+                                        skm = lk.save_as_string()
+                                    except Exception:
+                                        skm = None
+
+                                    new_data = dict(data if isinstance(data, dict) else {})
+                                    if skm:
+                                        new_data['license_skm'] = skm
+                                    # update activated_machines info if present
+                                    try:
+                                        new_data['activated_machines'] = getattr(lk, 'activated_machines', None)
+                                    except Exception:
+                                        pass
+                                    # persist
+                                    try:
+                                        license_manager.save_license(new_data)
+                                    except Exception:
+                                        pass
+                                    # successful: sleep longer
+                                    time.sleep(LONG_INTERVAL)
+                                else:
+                                    # failed: retry soon
+                                    time.sleep(SHORT_INTERVAL)
+                            except Exception:
+                                # on unexpected errors, wait and retry
+                                time.sleep(SHORT_INTERVAL)
+
+                    t_reval = threading.Thread(target=revalidate_loop, args=(app,), daemon=True)
+                    t_reval.start()
                 except Exception:
                     pass
                 app.mainloop()

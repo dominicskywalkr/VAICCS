@@ -60,8 +60,9 @@ python .\gui.py
 
 	Saved JSON keys related to these options include: `bleep_mode`, `bleep_custom_text`, and `bleep_mask_char`.
 
-GUI tips:
+- GUI tips:
 - Use the **Browse...** button next to the Vosk model field to point to a model directory.
+- If a model is already downloaded (marked with a ✓) in the Vosk Model Manager, you can now press **Select Installed** or double-click the model to set it as the active model in the GUI. This will populate the Vosk Model path field and update the status.
 - If a model is not available or `vosk` is not installed, the GUI offers a demo mode to test capture and display.
 - For consistent results on Windows, pick the correct loopback or microphone device from the Audio Input dropdown.
 
@@ -152,6 +153,8 @@ Notes about `-save` path resolution:
 
 - To use real recognition, download a compatible Vosk model and point the GUI to the unpacked model directory.
 - If `vosk` or native dependencies are not available, the GUI can run in demo mode so you can still test audio capture and UI features.
+
+Note: by default, the GUI installs Vosk models into a `models/` folder located next to the application root. When you run `gui.py` or `launcher.py` from the project folder (e.g., in VS Code), the app will prefer the project folder as the application root and create/use `./models/`. For packaged builds the models are installed next to the EXE. You can override this behavior with the `VAICCS_MODELS_ROOT` or `VOSK_MODELS_ROOT` environment variables.
 
 ## Troubleshooting
 

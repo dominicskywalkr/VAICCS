@@ -19,6 +19,11 @@ class Splash(tk.Toplevel):
             self.overrideredirect(True)
         except Exception:
             pass
+        # Also set the window title so the annotation is visible in the OS title bar
+        try:
+            self.title(title_text)
+        except Exception:
+            pass
         try:
             frm = ttk.Frame(self, padding=12)
             frm.pack(fill=tk.BOTH, expand=True)

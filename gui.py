@@ -18,6 +18,9 @@ from main import CaptionEngine
 import main as mainmod
 from voice_profiles import VoiceProfileManager
 from parse_vosk_headless import parse_vosk_models
+from parse_hance_headless import parse_hance_models
+import resources
+import noise_cancel
 # Import our local serial helpers. `serial_helper` itself handles the
 # absence of the `pyserial` package (it sets `serial=None`), so we can
 # import it directly. Previous attempts to temporarily remove the
@@ -51,6 +54,28 @@ class App(tk.Tk):
         # Set up the main window (kept hidden until splash is closed)
         self.title("VAICCS (internal alpha)")
         self.geometry("900x750")
+
+        # Replace the default Tk icon (feather) with bundled `icon.ico` if available
+        try:
+            try:
+                icon_path = resources._resource_path('icon.ico')
+            except Exception:
+                icon_path = 'icon.ico'
+            if icon_path and os.path.exists(icon_path):
+                try:
+                    # Preferred on Windows: .ico via iconbitmap
+                    self.iconbitmap(icon_path)
+                except Exception:
+                    try:
+                        # Fallback: use PhotoImage (works for some formats)
+                        img = tk.PhotoImage(file=icon_path)
+                        self.iconphoto(False, img)
+                        # Keep reference to avoid GC
+                        self._app_icon_image = img
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # shared UI state
         self.auto_scroll_var = tk.BooleanVar(value=True)
@@ -97,7 +122,6 @@ class App(tk.Tk):
         except Exception:
             self._bad_words_menu_index = None
         file_menu.add_command(label="Open Settings...", accelerator="Ctrl+O", command=lambda: self._on_open_settings())
-        file_menu.add_command(label="Vosk Models...", command=lambda: self._open_vosk_model_manager())
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Alt-F4", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -116,6 +140,15 @@ class App(tk.Tk):
         self.bleep_mode_var = tk.StringVar(value=mode)
         self.bleep_custom_var = tk.StringVar(value=custom)
         self.bleep_mask_var = tk.StringVar(value=mask)
+        # Noise cancelation enabled state (shared so main tab can toggle it)
+        self.noise_enabled_var = tk.BooleanVar(value=False)
+
+        # Models menu: Vosk models + future Hance models placeholder
+        models_menu = tk.Menu(menubar, tearoff=0)
+        models_menu.add_command(label="Vosk Models...", command=lambda: self._open_vosk_model_manager())
+        # Placeholder entry for future Hance models manager
+        models_menu.add_command(label="Hance Models...", command=lambda: self._open_hance_model_manager())
+        menubar.add_cascade(label="Models", menu=models_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         # Auto-scroll menu item bound to the shared variable
@@ -124,6 +157,8 @@ class App(tk.Tk):
         menubar.add_cascade(label="View", menu=view_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        # Activate dialog (personal free / commercial paid). Placeholder UI.
+        help_menu.add_command(label="Activate", command=lambda: self._open_activate())
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nInternal Alpha Build"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -186,6 +221,17 @@ class App(tk.Tk):
         except Exception:
             pass
         self._build_vocab_tab()
+
+        # Noise cancellation tab (Hance integration)
+        self.noise_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.noise_frame, text="Noise Cancelation")
+
+        try:
+            if self._splash:
+                self._splash.update_status("Building noise cancelation tab...")
+        except Exception:
+            pass
+        self._build_noise_tab()
 
         self.engine: CaptionEngine | None = None
         # session state for opened/saved settings file (no automatic persistence)
@@ -290,6 +336,13 @@ class App(tk.Tk):
             pass
         self._populate_audio_devices()
 
+        # Noise cancelation quick toggle (main page)
+        try:
+            self.noise_chk = ttk.Checkbutton(right, text="Enable Noise Cancelation", variable=self.noise_enabled_var, command=self._on_toggle_noise)
+            self.noise_chk.pack(padx=8, anchor=tk.W, pady=(6,8))
+        except Exception:
+            pass
+
         # Serial output controls
         ttk.Label(right, text="Serial Output:").pack(pady=(12, 2), padx=8, anchor=tk.W)
         self.serial_enabled_var = tk.BooleanVar(value=False)
@@ -345,22 +398,90 @@ class App(tk.Tk):
         self._model_download_thread = None
         # models folder where downloaded models are installed
         try:
-            # When running as a frozen executable (PyInstaller onefile etc.),
-            # prefer the directory containing the executable so downloaded
-            # models are placed next to `gui.exe` instead of the temporary
-            # extraction folder under AppData/Temp. When running from source,
-            # use the project directory (where this script lives).
-            if getattr(sys, 'frozen', False):
-                base_dir = os.path.dirname(os.path.abspath(sys.executable))
+            # Allow explicit override via environment variable for packaged
+            # builds or tests: `VAICCS_MODELS_ROOT` or `VOSK_MODELS_ROOT`.
+            env_root = os.environ.get('VAICCS_MODELS_ROOT') or os.environ.get('VOSK_MODELS_ROOT')
+
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            try:
+                script_dir = os.path.abspath(os.path.dirname(__file__))
+            except Exception:
+                script_dir = exe_dir
+
+            # Determine OS temp dir for detection of onefile extraction
+            try:
+                tmpdir = os.path.abspath(tempfile.gettempdir())
+            except Exception:
+                tmpdir = None
+
+            def _is_under_tmp(p: str) -> bool:
+                try:
+                    if not p or not tmpdir:
+                        return False
+                    return os.path.abspath(p).lower().startswith(tmpdir.lower())
+                except Exception:
+                    return False
+
+            # Resolve preferred root in order of preference:
+            # 1) explicit env var
+            # 2) script_dir if it's not under temp (running from source) — prefer project folder while running from VSCode/IDE
+            # 3) exe_dir if it's not under temp (packaged)
+            # 4) per-user LOCALAPPDATA under 'VAICCS' (persistent)
+            # 5) exe_dir (last resort)
+            chosen = None
+            if env_root:
+                chosen = env_root
+            elif script_dir and not _is_under_tmp(script_dir):
+                chosen = script_dir
+            elif exe_dir and not _is_under_tmp(exe_dir):
+                chosen = exe_dir
             else:
-                base_dir = os.path.abspath(os.path.dirname(__file__))
-            self.models_root = os.path.join(base_dir, 'models')
+                # Use LOCALAPPDATA if available for a persistent per-user folder
+                local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+                if local:
+                    chosen = os.path.join(local, 'VAICCS')
+                else:
+                    chosen = exe_dir
+
+            # Save the resolved application root path and models folder location.
+            # We prefer `script_dir` when running from source (e.g., in VS Code) so
+            # that models install next to the repository rather than under Python's
+            # interpreter installation directory (e.g. AppData/Local/Programs/Python).
+            self.app_root = os.path.abspath(chosen)
+            self.models_root = os.path.join(self.app_root, 'models')
             os.makedirs(self.models_root, exist_ok=True)
+            # Write startup log in models folder so packaged builds can report where the app writes models
+            try:
+                app_log = os.path.join(self.models_root, 'app_install.log')
+                with open(app_log, 'a', encoding='utf-8') as lf:
+                    lf.write(f"App root: {self.app_root}\nModels root: {self.models_root}\nWriteable: {os.access(self.models_root, os.W_OK)}\n\n")
+            except Exception:
+                pass
         except Exception:
             try:
-                self.models_root = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'models')
+                exe_app_root = os.path.dirname(os.path.abspath(sys.executable))
+                self.app_root = exe_app_root
+                self.models_root = os.path.join(exe_app_root, 'models')
             except Exception:
-                self.models_root = os.path.abspath(os.path.dirname(__file__))
+                try:
+                    script_app_root = os.path.abspath(os.path.dirname(__file__))
+                    self.app_root = script_app_root
+                    self.models_root = os.path.join(script_app_root, 'models')
+                except Exception:
+                    # final fallback: use current working directory
+                    self.app_root = os.path.abspath(os.getcwd())
+                    self.models_root = os.path.join(self.app_root, 'models')
+            try:
+                os.makedirs(self.models_root, exist_ok=True)
+                try:
+                    # write log similarly in fallback branch
+                    app_log = os.path.join(self.models_root, 'app_install.log')
+                    with open(app_log, 'a', encoding='utf-8') as lf:
+                        lf.write(f"App fallback root: {self.app_root}\nModels root: {self.models_root}\nWriteable: {os.access(self.models_root, os.W_OK)}\n\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # Finalize splash and show main window
         try:
@@ -517,6 +638,7 @@ class App(tk.Tk):
             self.serial_enabled_var.set(False)
         # no automatic persistence
 
+    #send a test line over serial button
     def _send_test_serial(self):
         try:
             if not self.serial_manager:
@@ -1216,6 +1338,24 @@ class App(tk.Tk):
             dlg.transient(self)
         except Exception:
             pass
+        # set dialog icon to bundled icon.ico if available
+        try:
+            try:
+                dlg_icon = resources._resource_path('icon.ico')
+            except Exception:
+                dlg_icon = 'icon.ico'
+            if dlg_icon and os.path.exists(dlg_icon):
+                try:
+                    dlg.iconbitmap(dlg_icon)
+                except Exception:
+                    try:
+                        img = tk.PhotoImage(file=dlg_icon)
+                        dlg.iconphoto(False, img)
+                        dlg._icon_image = img
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         dlg.title("Options")
         try:
             dlg.grab_set()
@@ -1413,11 +1553,47 @@ class App(tk.Tk):
             self.wait_window(dlg)
         except Exception:
             pass
+
+    def _open_activate(self):
+        """Open the activation dialog (placeholder UI)."""
+        try:
+            # import lazily to keep startup lightweight
+            import activate as activate_mod
+            try:
+                activate_mod.show_activate_dialog(self)
+            except Exception as e:
+                try:
+                    messagebox.showerror("Activate", f"Activation dialog failed: {e}")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                messagebox.showerror("Activate", f"Failed to open activation module: {e}")
+            except Exception:
+                pass
     # Vosk model manager dialog (languages -> models with sizes)
     def _open_vosk_model_manager(self):
         dlg = tk.Toplevel(self)
         try:
             dlg.transient(self)
+        except Exception:
+            pass
+        # set dialog icon to bundled icon.ico if available
+        try:
+            try:
+                dlg_icon = resources._resource_path('icon.ico')
+            except Exception:
+                dlg_icon = 'icon.ico'
+            if dlg_icon and os.path.exists(dlg_icon):
+                try:
+                    dlg.iconbitmap(dlg_icon)
+                except Exception:
+                    try:
+                        img = tk.PhotoImage(file=dlg_icon)
+                        dlg.iconphoto(False, img)
+                        dlg._icon_image = img
+                    except Exception:
+                        pass
         except Exception:
             pass
         dlg.title("Vosk Model Manager")
@@ -1461,6 +1637,13 @@ class App(tk.Tk):
 
         status_var = tk.StringVar(value="Click Refresh to load models from https://alphacephei.com/vosk/models")
         ttk.Label(frm, textvariable=status_var, wraplength=500).pack(anchor=tk.W, pady=(6,4))
+        # Show where models will be installed (helpful for packaged builds)
+        try:
+            self._models_root_var = tk.StringVar(value=self.models_root)
+            ttk.Label(frm, text="Install path:", foreground='gray').pack(anchor=tk.W)
+            ttk.Label(frm, textvariable=self._models_root_var, wraplength=500).pack(anchor=tk.W, pady=(0,6))
+        except Exception:
+            pass
 
         progress = ttk.Progressbar(frm, orient='horizontal', length=400, mode='determinate')
         progress.pack(fill=tk.X, pady=(4,4))
@@ -1481,6 +1664,24 @@ class App(tk.Tk):
             for L in langs:
                 lang_listbox.insert(tk.END, L)
 
+        def _get_installed_dirs():
+            try:
+                return [d for d in os.listdir(self.models_root) if os.path.isdir(os.path.join(self.models_root, d))]
+            except Exception:
+                return []
+
+        def _find_installed_model_dir(disp_name: str):
+            if not disp_name:
+                return None
+            dn = disp_name.lower().strip()
+            for inst in _get_installed_dirs():
+                try:
+                    if inst.lower().strip() == dn:
+                        return os.path.join(self.models_root, inst)
+                except Exception:
+                    continue
+            return None
+
         def _populate_models_for(lang, filter_q=None):
             for i in models_tree.get_children():
                 models_tree.delete(i)
@@ -1490,24 +1691,9 @@ class App(tk.Tk):
             if filter_q:
                 fq = filter_q.lower()
                 items = [it for it in items if fq in (it.get('name') or '').lower() or fq in (it.get('url') or '').lower()]
-            # Determine installed models in models_root
-            try:
-                installed_dirs = [d for d in os.listdir(self.models_root) if os.path.isdir(os.path.join(self.models_root, d))]
-            except Exception:
-                installed_dirs = []
+            # Determine installed models in models_root (via helper)
             def is_installed(disp_name: str) -> bool:
-                # Exact folder-name match (case-insensitive). This avoids
-                # false positives from substring/prefix heuristics.
-                if not disp_name:
-                    return False
-                dn = disp_name.lower().strip()
-                for inst in installed_dirs:
-                    try:
-                        if inst.lower().strip() == dn:
-                            return True
-                    except Exception:
-                        continue
-                return False
+                return _find_installed_model_dir(disp_name) is not None
 
             for it in items:
                 name = it.get('name')
@@ -1605,6 +1791,52 @@ class App(tk.Tk):
 
             # Download into a temporary file under models_root
             dest_dir = self.models_root
+            # Verify writeability of dest_dir; packaged installs (Program Files) may not be writable.
+            try:
+                test_path = os.path.join(dest_dir, '.write_test')
+                with open(test_path, 'w', encoding='utf-8') as tf:
+                    tf.write('test')
+                try:
+                    os.remove(test_path)
+                except Exception:
+                    pass
+            except Exception:
+                # Not writeable -> try per-user LocalAppData path as a fallback
+                try:
+                    local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA') or os.path.expanduser('~')
+                    fallback = os.path.join(local, 'VAICCS', 'models')
+                    os.makedirs(fallback, exist_ok=True)
+                    old_dest = dest_dir
+                    dest_dir = fallback
+                    try:
+                        self.models_root = dest_dir
+                    except Exception:
+                        pass
+                    try:
+                        # update UI var so the user can see where the model was saved
+                        if getattr(self, '_models_root_var', None):
+                            self._models_root_var.set(dest_dir)
+                    except Exception:
+                        pass
+                except Exception:
+                    # if fallback also fails, leave dest_dir as original and attempt to proceed
+                    try:
+                        _hlog(f"Write test failed for {self.models_root} and fallback creation failed")
+                    except Exception:
+                        pass
+            try:
+                log_dir = dest_dir
+                os.makedirs(log_dir, exist_ok=True)
+                hance_log = os.path.join(log_dir, 'hance_install.log')
+            except Exception:
+                hance_log = None
+            def _hlog(msg: str):
+                try:
+                    if hance_log:
+                        with open(hance_log, 'a', encoding='utf-8') as lf:
+                            lf.write(msg + '\n')
+                except Exception:
+                    pass
             fname = os.path.basename(url.split('?')[0])
             dest_path = os.path.join(dest_dir, fname)
 
@@ -1613,6 +1845,10 @@ class App(tk.Tk):
 
             def worker_download():
                 try:
+                    try:
+                        _hlog(f"Hance download worker starting for {name} URL={url} dest={dest_dir} dest_path={dest_path}")
+                    except Exception:
+                        pass
                     # Setup cancel event so user can cancel this download
                     self._model_download_cancel_event = threading.Event()
                     self._model_download_thread = threading.current_thread()
@@ -1653,6 +1889,10 @@ class App(tk.Tk):
                             os.replace(tmp_path, dest_path)
                         except Exception:
                             shutil.move(tmp_path, dest_path)
+                        try:
+                            _hlog(f"Downloaded file saved to: {dest_path}")
+                        except Exception:
+                            pass
                     # extraction
                     status = 'Download complete. Extracting...'
                     self.after(0, lambda: status_var.set(status))
@@ -1662,10 +1902,25 @@ class App(tk.Tk):
                     except Exception as e:
                         self.after(0, lambda: messagebox.showerror('Vosk Models', f'Extraction failed: {e}'))
                         return
+                    # Only remove the downloaded archive if extraction succeeded;
+                    # otherwise keep the model file (e.g., .hance) in place.
+                    was_extracted = False
                     try:
-                        os.remove(dest_path)
+                        # detect archive-like extensions and attempt extraction
+                        archive_exts = ('.zip', '.tar.gz', '.tgz', '.tar', '.tar.bz2', '.tar.xz', '.7z')
+                        if any(dest_path.lower().endswith(ext) for ext in archive_exts):
+                            try:
+                                self._extract_archive(dest_path, dest_dir)
+                                was_extracted = True
+                            except Exception:
+                                was_extracted = False
                     except Exception:
-                        pass
+                        was_extracted = False
+                    if was_extracted:
+                        try:
+                            os.remove(dest_path)
+                        except Exception:
+                            pass
                     # set model path to extracted folder
                     found_folder = None
                     for nm in os.listdir(extract_to):
@@ -1726,6 +1981,59 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        def _select_installed():
+            sel = models_tree.selection()
+            if not sel:
+                messagebox.showwarning('Vosk Models', 'Select a model to choose')
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            if not vals:
+                messagebox.showerror('Vosk Models', 'No model selected')
+                return
+            name = vals[1]
+            target = _find_installed_model_dir(name)
+            if not target:
+                messagebox.showerror('Vosk Models', 'Selected model is not installed')
+                return
+            # Set model path to installed folder and update status
+            self.after(0, lambda: [self.model_path_var.set(target), self._update_model_status(), status_var.set(f'Selected installed: {os.path.basename(target)}'), dlg.destroy()])
+
+        def _on_tree_select(evt=None):
+            # enable/disable select button depending on whether the selected
+            # model is already installed
+            sel = models_tree.selection()
+            if not sel:
+                try:
+                    select_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            name = (vals[1] if vals and len(vals) > 1 else '')
+            if _find_installed_model_dir(name):
+                try:
+                    select_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+            else:
+                try:
+                    select_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+
+        def _on_tree_doubleclick(evt=None):
+            # If double-clicked on an installed model, select it.
+            sel = models_tree.selection()
+            if not sel:
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            name = (vals[1] if vals and len(vals) > 1 else '')
+            if _find_installed_model_dir(name):
+                _select_installed()
+
         def _close():
             try:
                 dlg.destroy()
@@ -1734,11 +2042,419 @@ class App(tk.Tk):
 
         ttk.Button(btn_frm, text="Refresh", command=_refresh_models).pack(side=tk.LEFT)
         ttk.Button(btn_frm, text="Download Selected", command=_download_selected).pack(side=tk.LEFT, padx=(6,0))
+        select_btn = ttk.Button(btn_frm, text="Select Installed", command=_select_installed)
+        select_btn.pack(side=tk.LEFT, padx=(6,0))
+        select_btn.config(state=tk.DISABLED)
         ttk.Button(btn_frm, text="Cancel Download", command=_cancel_download).pack(side=tk.LEFT, padx=(6,0))
         ttk.Button(btn_frm, text="Close", command=_close).pack(side=tk.RIGHT)
 
         # center and open
         try:
+            # hook selection change and double-click events to the tree
+            models_tree.bind('<<TreeviewSelect>>', lambda e: _on_tree_select(e))
+            models_tree.bind('<Double-1>', lambda e: _on_tree_doubleclick(e))
+
+            self.update_idletasks()
+            dlg.update_idletasks()
+            x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        try:
+            self.wait_window(dlg)
+        except Exception:
+            pass
+
+    # Hance model manager dialog (simple single-list)
+    def _open_hance_model_manager(self):
+        dlg = tk.Toplevel(self)
+        try:
+            dlg.transient(self)
+        except Exception:
+            pass
+        try:
+            dlg_icon = resources._resource_path('icon.ico')
+        except Exception:
+            dlg_icon = 'icon.ico'
+        try:
+            if dlg_icon and os.path.exists(dlg_icon):
+                try:
+                    dlg.iconbitmap(dlg_icon)
+                except Exception:
+                    try:
+                        img = tk.PhotoImage(file=dlg_icon)
+                        dlg.iconphoto(False, img)
+                        dlg._icon_image = img
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        dlg.title("Hance Model Manager")
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        frm = ttk.Frame(dlg, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Available Hance Models:").pack(anchor=tk.W)
+        # search / filter
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(frm, textvariable=search_var)
+        search_entry.pack(fill=tk.X, pady=(4,4))
+
+        # models list only (no languages)
+        cols = ('installed', 'model', 'size')
+        models_tree = ttk.Treeview(frm, columns=cols, show='headings', height=12)
+        models_tree.heading('installed', text='')
+        models_tree.heading('model', text='Model')
+        models_tree.heading('size', text='Size')
+        models_tree.column('installed', anchor=tk.CENTER, width=30)
+        models_tree.column('model', anchor=tk.W, width=350)
+        models_tree.column('size', anchor=tk.CENTER, width=80)
+        models_tree.pack(fill=tk.BOTH, expand=True, pady=(4,4))
+
+        status_var = tk.StringVar(value="Click Refresh to load models from GitHub: hance-engine/hance-api/Models")
+        ttk.Label(frm, textvariable=status_var, wraplength=500).pack(anchor=tk.W, pady=(6,4))
+        # Show where models will be installed
+        try:
+            self._models_root_var = tk.StringVar(value=self.models_root)
+            ttk.Label(frm, text="Install path:", foreground='gray').pack(anchor=tk.W)
+            ttk.Label(frm, textvariable=self._models_root_var, wraplength=500).pack(anchor=tk.W, pady=(0,6))
+        except Exception:
+            pass
+
+        progress = ttk.Progressbar(frm, orient='horizontal', length=400, mode='determinate')
+        progress.pack(fill=tk.X, pady=(4,4))
+
+        btn_frm = ttk.Frame(frm)
+        btn_frm.pack(fill=tk.X, pady=(6,0))
+
+        models_list = []
+
+        def _clear_models_view():
+            for i in models_tree.get_children():
+                models_tree.delete(i)
+
+        def _get_installed_entries():
+            try:
+                return [d for d in os.listdir(self.models_root)]
+            except Exception:
+                return []
+
+        def _find_installed_model_path(disp_name: str):
+            if not disp_name:
+                return None
+            dn = disp_name.strip().lower()
+            for candidate in _get_installed_entries():
+                try:
+                    if candidate.lower().strip() == dn:
+                        p = os.path.join(self.models_root, candidate)
+                        return p
+                    # also check filename matches
+                    if os.path.splitext(candidate)[0].lower().strip() == os.path.splitext(dn)[0]:
+                        return os.path.join(self.models_root, candidate)
+                except Exception:
+                    continue
+            return None
+
+        def _populate_models(filter_q=None):
+            _clear_models_view()
+            items = list(models_list)
+            if filter_q:
+                fq = filter_q.lower()
+                items = [it for it in items if fq in (it.get('name') or '').lower() or fq in (it.get('url') or '').lower()]
+
+            def is_installed(disp_name: str) -> bool:
+                return _find_installed_model_path(disp_name) is not None
+
+            for it in items:
+                name = it.get('name')
+                size = it.get('size','')
+                mark = '✓' if is_installed(name) else ''
+                models_tree.insert('', tk.END, values=(mark, name, size))
+
+        def _on_search(*a):
+            q = (search_var.get() or '').strip()
+            _populate_models(filter_q=q)
+
+        try:
+            search_var.trace_add('write', lambda *a: _on_search())
+        except Exception:
+            try:
+                search_var.trace('w', lambda *a: _on_search())
+            except Exception:
+                pass
+
+        def _refresh_models():
+            status_var.set('Fetching model list...')
+            progress.config(mode='indeterminate')
+            progress.start(10)
+
+            def worker():
+                nonlocal models_list
+                try:
+                    models_map = parse_hance_models()
+                    # flatten
+                    items = []
+                    for v in models_map.values():
+                        items.extend(v)
+                    models_list = items
+                except Exception as e:
+                    models_list = []
+                    self.after(0, lambda: status_var.set(f"Failed to fetch models: {e}"))
+                finally:
+                    def ui_done():
+                        progress.stop()
+                        progress.config(mode='determinate', value=0)
+                        _clear_models_view()
+                        _populate_models()
+                        status_var.set(f"Loaded {len(models_list)} Hance model(s)")
+                    self.after(0, ui_done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _download_selected():
+            sel = models_tree.selection()
+            if not sel:
+                messagebox.showwarning('Hance Models', 'Select a model to download')
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            if not vals:
+                messagebox.showerror('Hance Models', 'No model selected')
+                return
+            name = vals[1]
+            # find URL by matching name
+            candidates = [m for m in models_list if m.get('name') == name]
+            if not candidates:
+                messagebox.showerror('Hance Models', 'Model metadata not found')
+                return
+            item = candidates[0]
+            url = item.get('url')
+            if not url:
+                messagebox.showerror('Hance Models', 'No download URL found')
+                return
+            if not messagebox.askyesno('Download', f"Download and install Hance model '{name}' to application models directory? This may be large."):
+                return
+
+            dest_dir = self.models_root
+            fname = os.path.basename(url.split('?')[0])
+            dest_path = os.path.join(dest_dir, fname)
+
+            progress.config(mode='determinate', value=0, maximum=100)
+            status_var.set('Starting download...')
+
+            def worker_download():
+                try:
+                    self._model_download_cancel_event = threading.Event()
+                    self._model_download_thread = threading.current_thread()
+                    with requests.get(url, stream=True, timeout=30) as r:
+                        r.raise_for_status()
+                        total = r.headers.get('Content-Length')
+                        if total is None:
+                            total = 0
+                        else:
+                            total = int(total)
+                        written = 0
+                        tmp_path = dest_path + '.part'
+                        with open(tmp_path, 'wb') as outf:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if self._model_download_cancel_event is not None and self._model_download_cancel_event.is_set():
+                                    try:
+                                        outf.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        os.remove(tmp_path)
+                                    except Exception:
+                                        pass
+                                    self.after(0, lambda: status_var.set('Download cancelled'))
+                                    return
+                                if not chunk:
+                                    continue
+                                outf.write(chunk)
+                                written += len(chunk)
+                                if total:
+                                    pct = int(written * 100 / total)
+                                else:
+                                    pct = 0
+                                self.after(0, lambda p=pct: progress.config(value=p))
+                        try:
+                            os.replace(tmp_path, dest_path)
+                        except Exception:
+                            shutil.move(tmp_path, dest_path)
+                    # extraction if archive
+                    status = 'Download complete. Extracting if needed...'
+                    self.after(0, lambda: status_var.set(status))
+                    was_extracted = False
+                    try:
+                        archive_exts = ('.zip', '.tar.gz', '.tgz', '.tar', '.tar.bz2', '.tar.xz', '.7z')
+                        if any(dest_path.lower().endswith(ext) for ext in archive_exts):
+                            try:
+                                self._extract_archive(dest_path, dest_dir)
+                                was_extracted = True
+                                try:
+                                    _hlog(f"File extracted: {dest_path} -> {dest_dir}")
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    _hlog(f"Extraction failed: {e}")
+                                except Exception:
+                                    pass
+                                was_extracted = False
+                        else:
+                            try:
+                                _hlog(f"Not an archive; skipping extraction: {dest_path}")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        try:
+                            _hlog(f"Extraction check error: {e}")
+                        except Exception:
+                            pass
+                        was_extracted = False
+                    if was_extracted:
+                        try:
+                            os.remove(dest_path)
+                        except Exception:
+                            pass
+                    # Find installed path
+                    found = None
+                    # If we extracted into a folder, prefer that
+                    for nm in os.listdir(dest_dir):
+                        pth = os.path.join(dest_dir, nm)
+                        try:
+                            if os.path.isdir(pth) and nm.lower().startswith(os.path.splitext(name)[0].lower()):
+                                found = pth
+                                break
+                        except Exception:
+                            continue
+                    # If not found by folder match, check for file by filename
+                    if not found:
+                        fpth = os.path.join(dest_dir, fname)
+                        if os.path.exists(fpth):
+                            found = fpth
+                    # As a final fallback search recursively for matching files (e.g., .hance files inside a directory)
+                    if not found:
+                        base_no_ext = os.path.splitext(name)[0].lower()
+                        for root, dirs, files in os.walk(dest_dir):
+                            for file in files:
+                                try:
+                                    if file.lower().startswith(base_no_ext) or os.path.splitext(file)[0].lower() == base_no_ext:
+                                        found = os.path.join(root, file)
+                                        break
+                                except Exception:
+                                    continue
+                            if found:
+                                break
+                    if found:
+                        try:
+                            _hlog(f"Found installed model path: {found}")
+                        except Exception:
+                            pass
+                        self.after(0, lambda: [self.hance_model_var.set(found), status_var.set(f'Installed: {os.path.basename(found)}')])
+                    else:
+                        self.after(0, lambda: status_var.set('Installed but model file not found; please browse manually'))
+                        try:
+                            _hlog(f"Model install not found after download. dest_dir={dest_dir}, fname={fname}, name={name}")
+                            _hlog(f"Models dir listing: {list(os.listdir(dest_dir))}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror('Hance Models', f'Download failed: {e}'))
+                    self.after(0, lambda: status_var.set('Download failed'))
+                finally:
+                    try:
+                        self._model_download_thread = None
+                        if self._model_download_cancel_event is not None:
+                            self._model_download_cancel_event = None
+                    except Exception:
+                        pass
+                    self.after(0, lambda: progress.config(value=0))
+
+            threading.Thread(target=worker_download, daemon=True).start()
+
+        def _cancel_download():
+            try:
+                if self._model_download_cancel_event is not None:
+                    self._model_download_cancel_event.set()
+                    status_var.set('Cancelling download...')
+                else:
+                    status_var.set('No active download')
+            except Exception:
+                pass
+
+        def _select_installed():
+            sel = models_tree.selection()
+            if not sel:
+                messagebox.showwarning('Hance Models', 'Select a model to choose')
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            if not vals:
+                messagebox.showerror('Hance Models', 'No model selected')
+                return
+            name = vals[1]
+            target = _find_installed_model_path(name)
+            if not target:
+                messagebox.showerror('Hance Models', 'Selected model is not installed')
+                return
+            self.after(0, lambda: [self.hance_model_var.set(target), self.noise_status_var.set(f"Installed (model:{os.path.basename(target)})"), dlg.destroy()])
+
+        def _on_tree_select(evt=None):
+            sel = models_tree.selection()
+            if not sel:
+                try:
+                    select_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            name = (vals[1] if vals and len(vals) > 1 else '')
+            if _find_installed_model_path(name):
+                try:
+                    select_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+            else:
+                try:
+                    select_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+
+        def _on_tree_doubleclick(evt=None):
+            sel = models_tree.selection()
+            if not sel:
+                return
+            item_id = sel[0]
+            vals = models_tree.item(item_id, 'values')
+            name = (vals[1] if vals and len(vals) > 1 else '')
+            if _find_installed_model_path(name):
+                _select_installed()
+
+        def _close():
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btn_frm, text="Refresh", command=_refresh_models).pack(side=tk.LEFT)
+        ttk.Button(btn_frm, text="Download Selected", command=_download_selected).pack(side=tk.LEFT, padx=(6,0))
+        select_btn = ttk.Button(btn_frm, text="Select Installed", command=_select_installed)
+        select_btn.pack(side=tk.LEFT, padx=(6,0))
+        select_btn.config(state=tk.DISABLED)
+        ttk.Button(btn_frm, text="Cancel Download", command=_cancel_download).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(btn_frm, text="Close", command=_close).pack(side=tk.RIGHT)
+
+        try:
+            models_tree.bind('<<TreeviewSelect>>', lambda e: _on_tree_select(e))
+            models_tree.bind('<Double-1>', lambda e: _on_tree_doubleclick(e))
             self.update_idletasks()
             dlg.update_idletasks()
             x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
@@ -2246,6 +2962,82 @@ class App(tk.Tk):
             self.samples_listbox.bind('<Double-Button-1>', lambda e: self._play_selected_sample())
         except Exception:
             pass
+
+    def _build_noise_tab(self):
+        frm = ttk.Frame(self.noise_frame, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(frm)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(left, text="Noise Cancelation (Hance)").pack(anchor=tk.W)
+
+        # Note: quick enable/disable control is on the Main tab; keep Noise
+        # tab focused on model and installation controls.
+
+        # Hance model selection
+        ttk.Label(left, text="Hance model file: (optional)").pack(anchor=tk.W, pady=(8,2))
+        model_frame = ttk.Frame(left)
+        model_frame.pack(fill=tk.X)
+        self.hance_model_var = tk.StringVar()
+        self.hance_model_entry = ttk.Entry(model_frame, textvariable=self.hance_model_var)
+        self.hance_model_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(model_frame, text="Browse...", command=self._browse_hance_model).pack(side=tk.RIGHT, padx=(6,0))
+
+        # Load / Unload buttons and status
+        btn_row = ttk.Frame(left)
+        btn_row.pack(fill=tk.X, pady=(8,6))
+        self.load_hance_btn = ttk.Button(btn_row, text="Install Noise Filter", command=self._install_noise)
+        self.load_hance_btn.pack(side=tk.LEFT)
+        self.unload_hance_btn = ttk.Button(btn_row, text="Uninstall", command=self._uninstall_noise)
+        self.unload_hance_btn.pack(side=tk.LEFT, padx=(6,0))
+
+        self.noise_status_var = tk.StringVar(value="Not installed")
+        ttk.Label(left, textvariable=self.noise_status_var, foreground='blue').pack(anchor=tk.W)
+
+        # Helpful note
+        ttk.Label(left, text="Note: Hance SDK integration is attempted if available; otherwise a simple fallback noise gate is used.").pack(anchor=tk.W, pady=(6,0))
+
+    def _browse_hance_model(self):
+        path = filedialog.askopenfilename(title="Select Hance model file", filetypes=[('All files','*.*')])
+        if path:
+            self.hance_model_var.set(path)
+
+    def _install_noise(self):
+        path = (self.hance_model_var.get() or '').strip() or None
+        try:
+            ok = noise_cancel.install(path)
+            if ok:
+                self.noise_status_var.set(f"Installed (model:{os.path.basename(path) if path else 'fallback'})")
+                self.noise_enabled_var.set(True)
+            else:
+                self.noise_status_var.set("Failed to install")
+                self.noise_enabled_var.set(False)
+        except Exception as e:
+            try:
+                messagebox.showerror("Noise Cancel", f"Failed to install noise filter: {e}")
+            except Exception:
+                pass
+
+    def _uninstall_noise(self):
+        try:
+            ok = noise_cancel.uninstall()
+            if ok:
+                self.noise_status_var.set("Not installed")
+                self.noise_enabled_var.set(False)
+            else:
+                self.noise_status_var.set("Not installed")
+        except Exception:
+            try:
+                messagebox.showwarning("Noise Cancel", "Failed to uninstall noise filter")
+            except Exception:
+                pass
+
+    def _on_toggle_noise(self):
+        if self.noise_enabled_var.get():
+            self._install_noise()
+        else:
+            self._uninstall_noise()
 
     def _refresh_vocab_list(self):
         self.vocab_listbox.delete(0, tk.END)
