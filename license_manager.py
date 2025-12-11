@@ -1,12 +1,81 @@
 import os
+import sys
 import json
 import base64
 import datetime
 from typing import Dict, Optional, Tuple
 
 
+def _is_pyinstaller_bundle():
+    """Check if running inside a PyInstaller bundle."""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
+
+def _get_writable_data_dir():
+    """Get a writable directory for application data.
+    
+    Priority:
+    1. For PyInstaller: APPDATA/VAICCS or home/.vaiccs
+    2. For dev: module directory if writable, else cwd, else home
+    """
+    try:
+        # Check if we're in a PyInstaller bundle
+        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+            # PyInstaller bundle - use user's local app data or home directory
+            try:
+                # Try APPDATA\VAICCS first (Windows)
+                appdata = os.environ.get('APPDATA')
+                if appdata:
+                    vaiccs_dir = os.path.join(appdata, 'VAICCS')
+                    os.makedirs(vaiccs_dir, exist_ok=True)
+                    return vaiccs_dir
+            except Exception:
+                pass
+            
+            # Fallback to home directory
+            try:
+                home = os.path.expanduser('~')
+                vaiccs_dir = os.path.join(home, '.vaiccs')
+                os.makedirs(vaiccs_dir, exist_ok=True)
+                return vaiccs_dir
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # Development mode: try module dir, cwd, then home
+    try:
+        base = os.path.abspath(os.path.dirname(__file__))
+        if os.access(base, os.W_OK):
+            return base
+    except Exception:
+        pass
+    
+    try:
+        cwd = os.getcwd()
+        if os.access(cwd, os.W_OK):
+            return cwd
+    except Exception:
+        pass
+    
+    try:
+        home = os.path.expanduser('~')
+        if os.access(home, os.W_OK):
+            return home
+    except Exception:
+        pass
+    
+    return os.getcwd()
+
+
 def _license_path() -> str:
-    # Primary location: same directory as this module
+    # Get writable data directory
+    data_dir = _get_writable_data_dir()
+    return os.path.join(data_dir, 'license.json')
+
+
+def _module_license_path() -> str:
+    """Return license path in the module/project directory (for dev mode)."""
     try:
         base = os.path.abspath(os.path.dirname(__file__))
         return os.path.join(base, 'license.json')
@@ -14,31 +83,132 @@ def _license_path() -> str:
         return os.path.join(os.getcwd(), 'license.json')
 
 
-def _candidate_paths():
-    """Return candidate paths to look for or save license.json.
+def _log_message(msg: str) -> None:
+    """Append a short timestamped message to a license debug log in the
+    writable data directory. Best-effort; never raise."""
+    try:
+        d = _get_writable_data_dir()
+        if not d:
+            return
+        lf = os.path.join(d, 'license_debug.log')
+        ts = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
+        with open(lf, 'a', encoding='utf-8') as f:
+            f.write(f"{ts} - {msg}\n")
+    except Exception:
+        # never fail
+        pass
 
-    Order: module dir, current working directory, user home directory.
+
+def _candidate_paths():
+    """Return candidate paths to search for existing license.json.
+    
+    Order: writable data dir, module dir, current working directory, home directory.
     """
     paths = []
+    
+    # Always check the primary writable location first
+    try:
+        data_dir = _get_writable_data_dir()
+        paths.append(os.path.join(data_dir, 'license.json'))
+    except Exception:
+        pass
+    
+    # Then check module directory
     try:
         base = os.path.abspath(os.path.dirname(__file__))
         paths.append(os.path.join(base, 'license.json'))
     except Exception:
         pass
+    
+    # Then check current working directory
     try:
         paths.append(os.path.join(os.getcwd(), 'license.json'))
     except Exception:
         pass
+    
+    # Legacy locations for backward compatibility
     try:
         home = os.path.expanduser('~')
         paths.append(os.path.join(home, '.vaiccs_license.json'))
+        paths.append(os.path.join(home, '.vaiccs', 'license.json'))
     except Exception:
         pass
+    
+    # Also check APPDATA/VAICCS for cases where user previously ran a bundled
+    # (PyInstaller) build which writes into %APPDATA% even when current run
+    # is the unpacked/dev version.
+    try:
+        appdata = os.environ.get('APPDATA')
+        if appdata:
+            paths.insert(0, os.path.join(appdata, 'VAICCS', 'license.json'))
+    except Exception:
+        pass
+    
     return paths
 
 
 def load_license() -> Dict[str, str]:
-    """Load license.json if present; return empty dict if missing/invalid."""
+    """Load license.json if present; return empty dict if missing/invalid.
+
+    Migration behavior: if a license exists in the module (project) directory
+    but not the primary writable data directory, copy it into the primary
+    location so both bundled and dev runs find the same file.
+    """
+    primary = _license_path()
+    module_p = _module_license_path()
+
+    # Try primary first
+    try:
+        if os.path.exists(primary):
+            with open(primary, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _log_message(f"load_license: loaded primary: {primary}")
+                    return data
+    except Exception:
+        _log_message(f"load_license: failed to load primary: {primary}")
+        pass
+
+    # If primary missing, try module path and migrate it to primary
+    try:
+        if module_p and os.path.exists(module_p):
+            try:
+                with open(module_p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                _log_message(f"load_license: found module copy: {module_p}; migrating to primary: {primary}")
+                try:
+                    d = os.path.dirname(primary)
+                    if d and not os.path.exists(d):
+                        os.makedirs(d, exist_ok=True)
+                    tmp = primary + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as pf:
+                        json.dump(data, pf, indent=2)
+                    try:
+                        os.replace(tmp, primary)
+                        _log_message(f"load_license: migrated module copy into primary: {primary}")
+                    except Exception:
+                        _log_message(f"load_license: failed atomic replace during migration to primary: {primary}")
+                        try:
+                            os.remove(primary)
+                        except Exception:
+                            pass
+                        try:
+                            os.replace(tmp, primary)
+                        except Exception:
+                            _log_message(f"load_license: fallback replace also failed for primary: {primary}")
+                except Exception:
+                    _log_message(f"load_license: migration to primary raised exception for: {primary}")
+                return data
+    except Exception:
+        _log_message(f"load_license: error while reading module copy: {module_p}")
+        pass
+
+    # Fallback to scanning candidate paths (legacy)
+    # If primary existed but was corrupted/truncated, try to find a valid
+    # copy elsewhere (e.g., APPDATA) and migrate it into primary.
     for p in _candidate_paths():
         try:
             if not os.path.exists(p):
@@ -46,75 +216,140 @@ def load_license() -> Dict[str, str]:
             with open(p, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if isinstance(data, dict):
+                    _log_message(f"load_license: loaded candidate: {p}")
+                    # migrate into primary if needed
+                    try:
+                        # Overwrite primary (even if it exists) so a corrupt primary
+                        # file is repaired by a valid candidate copy found elsewhere.
+                        d = os.path.dirname(primary)
+                        if d and not os.path.exists(d):
+                            os.makedirs(d, exist_ok=True)
+                        tmp = primary + '.tmp'
+                        with open(tmp, 'w', encoding='utf-8') as pf:
+                            json.dump(data, pf, indent=2)
+                        try:
+                            os.replace(tmp, primary)
+                            _log_message(f"load_license: migrated candidate {p} into primary: {primary}")
+                        except Exception:
+                            _log_message(f"load_license: failed atomic replace while migrating candidate {p} to primary {primary}")
+                    except Exception:
+                        _log_message(f"load_license: migration attempt raised for candidate {p}")
                     return data
         except Exception:
+            _log_message(f"load_license: failed to read candidate: {p}")
             continue
     return {}
 
 
 def save_license(data: Dict[str, str]) -> bool:
     """Write license data to `license.json`. Returns True on success."""
-    # Optionally encrypt SKM per-machine if cryptography available and
-    # we can compute a machine-specific key. Do not modify caller dict.
+    # Keep the plaintext SKM for reliable loading across restarts.
+    # The SKM is already cryptographically signed by Cryptolens, so additional
+    # encryption is not necessary. Machine-code dependent encryption can fail
+    # on restart if machine code changes even slightly.
     out_data = dict(data) if isinstance(data, dict) else data
 
-    # Try to encrypt license_skm -> license_skm_encrypted with salt
+    # Save to the primary writable location (authoritative) using atomic write
+    success_primary = False
     try:
-        if isinstance(out_data, dict) and out_data.get('license_skm'):
+        p = _license_path()
+        d = os.path.dirname(p)
+        if d and not os.path.exists(d):
             try:
-                from licensing.methods import Helpers
+                os.makedirs(d, exist_ok=True)
             except Exception:
-                Helpers = None
-
+                pass
+        tmp = p + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(out_data, f, indent=2)
+        try:
+            os.replace(tmp, p)
+            success_primary = True
+            _log_message(f"save_license: wrote primary: {p}")
+        except Exception:
+            # best-effort: try to remove and replace
+            _log_message(f"save_license: atomic replace failed for primary: {p}")
             try:
-                from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-                from cryptography.hazmat.primitives import hashes
-                from cryptography.fernet import Fernet
+                if os.path.exists(p):
+                    os.remove(p)
             except Exception:
-                HKDF = None
-                Fernet = None
+                pass
+            try:
+                os.replace(tmp, p)
+                success_primary = True
+                _log_message(f"save_license: fallback replace succeeded for primary: {p}")
+            except Exception:
+                success_primary = False
+                _log_message(f"save_license: fallback replace failed for primary: {p}")
+    except Exception:
+        success_primary = False
+        _log_message(f"save_license: exception while writing primary: {_license_path()}")
 
-            if HKDF and Fernet and Helpers is not None:
+    # Also attempt to write a copy into the module directory (best-effort)
+    try:
+        module_p = _module_license_path()
+        if module_p and os.path.abspath(module_p) != os.path.abspath(_license_path()):
+            try:
+                md = os.path.dirname(module_p)
+                if md and not os.path.exists(md):
+                    os.makedirs(md, exist_ok=True)
+                tmpm = module_p + '.tmp'
+                with open(tmpm, 'w', encoding='utf-8') as mf:
+                    json.dump(out_data, mf, indent=2)
                 try:
-                    mc = Helpers.GetMachineCode(v=2)
+                    os.replace(tmpm, module_p)
+                    _log_message(f"save_license: wrote module copy: {module_p}")
                 except Exception:
-                    mc = None
-
-                if mc:
+                    _log_message(f"save_license: failed atomic replace for module copy: {module_p}")
                     try:
-                        salt = os.urandom(16)
-                        hk = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'vaiccs-license')
-                        raw = hk.derive(mc.encode('utf-8'))
-                        key = base64.urlsafe_b64encode(raw)
-                        f = Fernet(key)
-                        token = f.encrypt(out_data['license_skm'].encode('utf-8'))
-                        out_data.pop('license_skm', None)
-                        out_data['license_skm_encrypted'] = token.decode('utf-8')
-                        out_data['skm_salt'] = base64.b64encode(salt).decode('utf-8')
+                        if os.path.exists(module_p):
+                            os.remove(module_p)
                     except Exception:
-                        # fall back to plaintext if something goes wrong
                         pass
+                    try:
+                        os.replace(tmpm, module_p)
+                        _log_message(f"save_license: fallback replace succeeded for module copy: {module_p}")
+                    except Exception:
+                        _log_message(f"save_license: fallback replace failed for module copy: {module_p}")
+            except Exception:
+                _log_message(f"save_license: exception while writing module copy: {module_p}")
     except Exception:
         pass
 
-    # Try primary location first, then fall back to cwd and home
-    candidates = _candidate_paths()
-    last_exc = None
-    for p in candidates:
-        try:
-            d = os.path.dirname(p)
-            if d and not os.path.exists(d):
+    # Also write to APPDATA/VAICCS if available (best-effort)
+    try:
+        appdata = os.environ.get('APPDATA')
+        if appdata:
+            ap = os.path.join(appdata, 'VAICCS', 'license.json')
+            if os.path.abspath(ap) != os.path.abspath(_license_path()):
                 try:
-                    os.makedirs(d, exist_ok=True)
+                    ad = os.path.dirname(ap)
+                    if ad and not os.path.exists(ad):
+                        os.makedirs(ad, exist_ok=True)
+                    tm = ap + '.tmp'
+                    with open(tm, 'w', encoding='utf-8') as af:
+                        json.dump(out_data, af, indent=2)
+                    try:
+                        os.replace(tm, ap)
+                        _log_message(f"save_license: wrote APPDATA copy: {ap}")
+                    except Exception:
+                        _log_message(f"save_license: failed atomic replace for APPDATA copy: {ap}")
+                        try:
+                            if os.path.exists(ap):
+                                os.remove(ap)
+                        except Exception:
+                            pass
+                        try:
+                            os.replace(tm, ap)
+                            _log_message(f"save_license: fallback replace succeeded for APPDATA copy: {ap}")
+                        except Exception:
+                            _log_message(f"save_license: fallback replace failed for APPDATA copy: {ap}")
                 except Exception:
-                    pass
-            with open(p, 'w', encoding='utf-8') as f:
-                json.dump(out_data, f, indent=2)
-            return True
-        except Exception as e:
-            last_exc = e
-            continue
-    return False
+                    _log_message(f"save_license: exception while writing APPDATA copy: {ap}")
+    except Exception:
+        pass
+
+    return success_primary
 
 
 def clear_license() -> None:
@@ -144,47 +379,21 @@ def load_license_key_from_saved(pubkey: str, v: int = 2):
         data = load_license()
         if not data or not isinstance(data, dict):
             return None
-        # Support encrypted SKM (per-machine) as well as plain SKM
+        
+        # Prefer plaintext SKM for reliability across restarts
         skm = None
         if 'license_skm' in data and data.get('license_skm'):
             skm = data.get('license_skm')
-        elif 'license_skm_encrypted' in data and data.get('license_skm_encrypted'):
-            # attempt to decrypt using machine code-derived key
-            try:
-                from licensing.methods import Helpers
-            except Exception:
-                Helpers = None
-
-            try:
-                from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-                from cryptography.hazmat.primitives import hashes
-                from cryptography.fernet import Fernet
-            except Exception:
-                HKDF = None
-                Fernet = None
-
-            enc = data.get('license_skm_encrypted')
-            salt_b64 = data.get('skm_salt')
-            if HKDF and Fernet and Helpers is not None and enc and salt_b64:
-                try:
-                    mc = Helpers.GetMachineCode(v=2)
-                    salt = base64.b64decode(salt_b64)
-                    hk = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'vaiccs-license')
-                    raw = hk.derive(mc.encode('utf-8'))
-                    key = base64.urlsafe_b64encode(raw)
-                    f = Fernet(key)
-                    skm = f.decrypt(enc.encode('utf-8')).decode('utf-8')
-                except Exception:
-                    # decryption failed; treat as no valid SKM
-                    skm = None
 
         if not skm:
             return None
+        
         # Import here to avoid hard dependency when not used
         try:
             from licensing.models import LicenseKey
         except Exception:
             return None
+        
         # load_from_string signature: LicenseKey.load_from_string(pubkey, skm_string, [max_days])
         try:
             lk = LicenseKey.load_from_string(pubkey, skm)

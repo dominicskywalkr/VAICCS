@@ -206,6 +206,31 @@ def load_settings_to_app(app, path: str) -> bool:
             app._current_settings_file = path
         except Exception:
             pass
+        
+        # Load automations if present in settings (only for commercial licenses)
+        try:
+            automations_data = data.get('automations')
+            # check license status; if non-commercial, do not load automations from settings
+            try:
+                import license_manager
+                is_commercial = (license_manager.license_type() == 'commercial')
+            except Exception:
+                is_commercial = False
+
+            if automations_data and getattr(app, 'automation_manager', None) and is_commercial:
+                from automations import AutomationManager
+                app.automation_manager = AutomationManager.from_dict(automations_data)
+                app.automation_manager.set_callbacks(
+                    on_start=app._on_automation_start,
+                    on_stop=app._on_automation_stop
+                )
+                # Refresh the automations tab UI to show loaded automations
+                try:
+                    app._refresh_automations_display()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         return True
     except Exception:
@@ -225,17 +250,38 @@ def apply_startup_options(app, options: Dict[str, Any]):
     save = options.get('save')
     try:
         if save:
-            success = load_settings_to_app(app, save)
+            # respect license: do not allow loading settings via shortcut target in non-commercial mode
+            try:
+                import license_manager
+                is_commercial = (license_manager.license_type() == 'commercial')
+            except Exception:
+                is_commercial = False
+
+            if is_commercial:
+                success = load_settings_to_app(app, save)
+            else:
+                # ignore save/autoload request in personal/eval mode
+                success = False
     except Exception:
         success = False
 
     # autostart: start model if available
     try:
         if options.get('autostart'):
-            # start capture; start_capture handles model validation and demo fallback
+            # respect license: do not allow autostart via shortcut target in non-commercial mode
             try:
-                app.start_capture()
+                import license_manager
+                is_commercial = (license_manager.license_type() == 'commercial')
             except Exception:
+                is_commercial = False
+
+            if is_commercial:
+                try:
+                    app.start_capture()
+                except Exception:
+                    pass
+            else:
+                # ignore autostart in personal/eval mode
                 pass
     except Exception:
         pass

@@ -13,6 +13,10 @@ try:
     import numpy as np
 except Exception:
     np = None
+try:
+    from punctuator import Punctuator
+except Exception:
+    Punctuator = None
 
 # Configuration
 DEFAULT_MODEL_PATH = "model"
@@ -213,6 +217,13 @@ def callback(indata, frames, time, status):
         # Last-resort: ignore this chunk
         return
 
+
+# Recase subprocess integration removed. Previous session added a long-lived
+# subprocess wrapper here to run a third-party recase/punctuator. That code
+# has been intentionally removed to avoid relying on vendor scripts. If you
+# want to attach an external punctuation/casing service, implement a separate
+# adapter module and attach it to the engine at runtime.
+
 def format_timestamp(seconds):
     # Format seconds (float) into SRT timestamp: HH:MM:SS,mmm
     total_seconds = int(seconds)
@@ -235,7 +246,7 @@ class CaptionEngine:
     callback signature: fn(text: str)
     """
 
-    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, demo: bool = False, source: str = "mic", cpu_threads: Optional[int] = None, voice_profiles_dir: Optional[str] = "voice_profiles", profile_match_threshold: float = 0.7, enable_profile_matching: bool = True):
+    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, demo: bool = False, source: str = "mic", cpu_threads: Optional[int] = None, voice_profiles_dir: Optional[str] = "voice_profiles", profile_match_threshold: float = 0.7, enable_profile_matching: bool = True, punctuator: Optional[str] = None):
         self.model_path = model_path
         self.demo = demo
         self.source = source
@@ -263,6 +274,14 @@ class CaptionEngine:
         self._current_vocab = None
         # buffer for raw audio bytes corresponding to the current utterance
         self._chunk_buffer = bytearray()
+        # punctuator: optional path or model spec (e.g., 'hf:your-model-id')
+        try:
+            if Punctuator is not None:
+                self._punctuator = Punctuator.from_path(punctuator)
+            else:
+                self._punctuator = None
+        except Exception:
+            self._punctuator = None
 
     def _init_recognizer(self):
         # Determine whether to use recognizer
@@ -346,7 +365,35 @@ class CaptionEngine:
             return
 
         try:
-            self._model = Model(self.model_path)
+            # Support passing either a model directory or an archive file (zip/tar).
+            model_dir = self.model_path
+            # If the path is a file and looks like an archive, extract to a temp dir.
+            if os.path.isfile(model_dir):
+                lower = model_dir.lower()
+                archive_exts = ('.zip', '.tar.gz', '.tgz', '.tar', '.tar.bz2', '.tar.xz')
+                if any(lower.endswith(ext) for ext in archive_exts):
+                    try:
+                        import tempfile, zipfile, tarfile
+                        tmpd = tempfile.mkdtemp(prefix='vosk_model_')
+                        if lower.endswith('.zip'):
+                            with zipfile.ZipFile(model_dir, 'r') as zf:
+                                zf.extractall(tmpd)
+                        else:
+                            with tarfile.open(model_dir, 'r:*') as tfh:
+                                tfh.extractall(tmpd)
+                        # try to pick a sensible subfolder as the model dir
+                        for nm in os.listdir(tmpd):
+                            p = os.path.join(tmpd, nm)
+                            if os.path.isdir(p):
+                                model_dir = p
+                                break
+                        # remember to clean up when engine stops
+                        self._extracted_model_tmpdir = tmpd
+                    except Exception:
+                        # extraction failed; fall back to original path and continue
+                        model_dir = self.model_path
+
+            self._model = Model(model_dir)
             # If a runtime vocabulary was configured, pass it as grammar to KaldiRecognizer
             try:
                 if self._current_vocab:
@@ -430,6 +477,18 @@ class CaptionEngine:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2.0)
+        # Clean up any temporary extracted model directory created when a
+        # model archive was supplied.
+        try:
+            tmp = getattr(self, '_extracted_model_tmpdir', None)
+            if tmp and os.path.isdir(tmp):
+                try:
+                    import shutil
+                    shutil.rmtree(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _run_loop(self):
         # Safely drain any pending items from the queue without touching internals
@@ -528,10 +587,19 @@ class CaptionEngine:
                                             except Exception:
                                                 pass
 
+                                    # Post-process ASR text with our punctuator (if available).
+                                    try:
+                                        if getattr(self, '_punctuator', None) is not None:
+                                            final_text = self._punctuator.punctuate(bleeped)
+                                        else:
+                                            final_text = bleeped
+                                    except Exception:
+                                        final_text = bleeped
+
                                     if speaker:
-                                        out = f"[{speaker}] {bleeped}"
+                                        out = f"[{speaker}] {final_text}"
                                     else:
-                                        out = f"{bleeped}"
+                                        out = final_text
 
                                     # reset buffer for next utterance
                                     self._chunk_buffer = bytearray()

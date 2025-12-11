@@ -1,12 +1,17 @@
 numpy
 librosa
 soundfile
+serial
 pyserial
 requests
 beautifulsoup4
-# Cryptolens client SDK (optional): used for license validation
+vosk
+hance
+transformers
+
+
 licensing
 
-# Optional: required for Paddle webhook endpoint
+
 Flask
 cryptography

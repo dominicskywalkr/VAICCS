@@ -121,7 +121,13 @@ def show_activate_dialog(parent):
                     st = _lm.get_saved_license_status(RSAPUBKEY, v=2)
                     if st and isinstance(st, dict):
                         if st.get('status') == 'invalid':
-                            status_var.set('Local license: none or invalid')
+                            # If saved data exists but is encrypted (old format), show
+                            # informative status so user can repair. Otherwise show none/invalid.
+                            raw = _lm.load_license()
+                            if isinstance(raw, dict) and raw.get('type') == 'commercial' and raw.get('license_skm_encrypted'):
+                                status_var.set('Local license: commercial (encrypted — repair required)')
+                            else:
+                                status_var.set('Local license: none or invalid')
                         else:
                             s = st.get('status')
                             exp = st.get('expires')
@@ -309,6 +315,31 @@ def show_activate_dialog(parent):
 
                 license_key = result[0]
 
+                # Check if the customer email in the license matches the entered email
+                # The customer field may contain email or other customer info
+                try:
+                    customer_info = getattr(license_key, 'Customer', None)
+                    # Customer is likely a dict or object with customer details
+                    customer_email = None
+                    if isinstance(customer_info, dict):
+                        customer_email = customer_info.get('Email') or customer_info.get('email')
+                    elif hasattr(customer_info, 'Email'):
+                        customer_email = customer_info.Email
+                    elif hasattr(customer_info, 'email'):
+                        customer_email = customer_info.email
+                    
+                    # If we have a customer email and user entered an email, validate they match
+                    if customer_email and email:
+                        if customer_email.lower() != email.lower():
+                            messagebox.showerror('Activate', 
+                                f'The email address does not match the license registration.\n\n'
+                                f'Please verify you are using the correct email address for this license.')
+
+                            return
+                except Exception as e:
+                    # If we can't check customer email, log but continue
+                    print(f"Could not verify customer email: {e}")
+
                 # Determine whether to enforce node-locking
                 max_machines = getattr(license_key, 'max_no_of_machines', None)
                 activated = getattr(license_key, 'activated_machines', None)
@@ -353,6 +384,16 @@ def show_activate_dialog(parent):
                 dlg.destroy()
             except Exception:
                 pass
+
+            # Notify parent (GUI) so it can enable commercial features without restart
+            try:
+                if hasattr(parent, 'refresh_license_state'):
+                    try:
+                        parent.refresh_license_state()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             try:
                 messagebox.showerror('Activate', f'Activation failed: {e}')
@@ -367,6 +408,86 @@ def show_activate_dialog(parent):
 
     ttk.Button(btn_frm, text='Activate', command=on_activate).pack(side=tk.RIGHT)
     ttk.Button(btn_frm, text='Cancel', command=on_cancel).pack(side=tk.RIGHT, padx=(6,0))
+
+    # Repair button: attempt online revalidation to replace encrypted SKM with plaintext SKM
+    def on_repair():
+        try:
+            data = _lm.load_license()
+            product_key = data.get('product_key') if isinstance(data, dict) else None
+            if not product_key:
+                messagebox.showwarning('Repair', 'No product key saved locally to attempt repair.')
+                return
+
+            # Load token and rsa_pub/product_id like other code paths
+            token = os.environ.get('CRYPTOLENS_TOKEN', '')
+            rsa_pub = RSAPUBKEY or os.environ.get('CRYPTOLENS_RSA_PUBKEY', '')
+            product_id = os.environ.get('CRYPTOLENS_PRODUCT_ID', '')
+            if not (token and rsa_pub and product_id):
+                # try config file
+                try:
+                    base = os.path.abspath(os.path.dirname(__file__))
+                    cfg = os.path.join(base, 'cryptolens_config.json')
+                    if os.path.exists(cfg):
+                        with open(cfg, 'r', encoding='utf-8') as f:
+                            j = json.load(f)
+                        token = token or j.get('token', '')
+                        rsa_pub = rsa_pub or j.get('rsa_pubkey', '')
+                        product_id = product_id or str(j.get('product_id', ''))
+                except Exception:
+                    pass
+
+            if not (token and rsa_pub and product_id):
+                messagebox.showwarning('Repair', 'Cannot repair: Cryptolens token/product config missing.')
+                return
+
+            # Try online activate to get fresh SKM
+            try:
+                from licensing.methods import Key, Helpers
+            except Exception:
+                messagebox.showerror('Repair', 'Cryptolens SDK not available for repair.')
+                return
+
+            try:
+                mc = Helpers.GetMachineCode(v=2)
+            except Exception:
+                mc = None
+
+            try:
+                result = Key.activate(token=token, rsa_pub_key=rsa_pub, product_id=int(product_id), key=product_key, machine_code=mc)
+            except Exception as e:
+                messagebox.showerror('Repair', f'Online activation failed: {e}')
+                return
+
+            if not result or result[0] is None:
+                messagebox.showerror('Repair', 'Online activation failed (no license returned).')
+                return
+
+            lk = result[0]
+            try:
+                skm = lk.save_as_string()
+            except Exception:
+                skm = None
+
+            new_data = dict(data if isinstance(data, dict) else {})
+            if skm:
+                new_data['license_skm'] = skm
+                # remove old encrypted fields to avoid confusion
+                new_data.pop('license_skm_encrypted', None)
+                new_data.pop('skm_salt', None)
+
+            try:
+                _lm.save_license(new_data)
+                messagebox.showinfo('Repair', 'Local license repaired and saved.')
+                status_var.set('Local license: commercial (repaired)')
+            except Exception as e:
+                messagebox.showerror('Repair', f'Failed to save repaired license: {e}')
+        except Exception as e:
+            messagebox.showerror('Repair', f'Unexpected error during repair: {e}')
+
+    try:
+        ttk.Button(btn_frm, text='Repair Local License', command=on_repair).pack(side=tk.LEFT)
+    except Exception:
+        pass
 
     # center dialog over parent
     try:

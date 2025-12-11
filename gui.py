@@ -11,9 +11,6 @@ import tarfile
 import shutil
 import tempfile
 import sys
-import re
-import queue
-from bs4 import BeautifulSoup
 from main import CaptionEngine
 import main as mainmod
 from voice_profiles import VoiceProfileManager
@@ -21,6 +18,18 @@ from parse_vosk_headless import parse_vosk_models
 from parse_hance_headless import parse_hance_models
 import resources
 import noise_cancel
+from automations import AutomationManager, ShowAutomation
+# Lightweight fallback logger used by some async download/extract codepaths.
+# The GUI also defines a more specific `_hlog` in scopes where a per-download
+# log path is available; this module-level helper ensures static checks pass
+# and provides a best-effort append to `hance_install.log` in the current
+# working directory when a scoped logger is not present.
+def _hlog(msg: str):
+    try:
+        with open(os.path.join(os.getcwd(), 'hance_install.log'), 'a', encoding='utf-8') as lf:
+            lf.write(msg + '\n')
+    except Exception:
+        pass
 # Import our local serial helpers. `serial_helper` itself handles the
 # absence of the `pyserial` package (it sets `serial=None`), so we can
 # import it directly. Previous attempts to temporarily remove the
@@ -37,10 +46,10 @@ from gui_splash import Splash
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, simulate_automation: bool = False):
         super().__init__()
         try:
-            self._splash = Splash(self, title_text="VAICCS (internal alpha)", creator="Dominic Natoli")
+            self._splash = Splash(self, title_text="VAICCS (Beta)", creator="Dominic Natoli")
             self._splash.update_status("Starting...")
         except Exception:
             self._splash = None
@@ -52,8 +61,8 @@ class App(tk.Tk):
             pass
 
         # Set up the main window (kept hidden until splash is closed)
-        self.title("VAICCS (internal alpha)")
-        self.geometry("900x750")
+        self.title("VAICCS (Beta)")
+        self.geometry("900x900")
 
         # Replace the default Tk icon (feather) with bundled `icon.ico` if available
         try:
@@ -81,6 +90,14 @@ class App(tk.Tk):
         self.auto_scroll_var = tk.BooleanVar(value=True)
         # whether a bad words file has been loaded for this session (controls menu check)
         self._bad_words_loaded_var = tk.BooleanVar(value=False)
+        # Auto-save transcript option
+        self.auto_save_txt_var = tk.BooleanVar(value=False)
+        self.auto_save_txt_path = os.path.join(os.getcwd(), 'transcripts')
+        # Create transcripts directory if it doesn't exist (for auto-save feature)
+        try:
+            os.makedirs(self.auto_save_txt_path, exist_ok=True)
+        except Exception:
+            pass
         # SRT caption duration (seconds) -- default; used by Export SRT and Options
         try:
             self.srt_duration_var = tk.DoubleVar(value=2.0)
@@ -159,7 +176,7 @@ class App(tk.Tk):
         help_menu = tk.Menu(menubar, tearoff=0)
         # Activate dialog (personal free / commercial paid). Placeholder UI.
         help_menu.add_command(label="Activate", command=lambda: self._open_activate())
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nInternal Alpha Build"))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nBeta Build"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         try:
@@ -201,6 +218,18 @@ class App(tk.Tk):
         self.vocab_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.vocab_frame, text="Custom Words")
 
+        # License gating: determine if commercial features should be enabled
+        try:
+            try:
+                import license_manager
+                self._is_commercial = (license_manager.license_type() == 'commercial')
+            except Exception:
+                self._is_commercial = False
+        except Exception:
+            self._is_commercial = False
+        # Convenience flag controlling Automations UI/behavior
+        self._automations_allowed = bool(self._is_commercial)
+
         try:
             if self._splash:
                 self._splash.update_status("Building main tab...")
@@ -222,6 +251,30 @@ class App(tk.Tk):
             pass
         self._build_vocab_tab()
 
+        self.engine: CaptionEngine | None = None
+        # session state for opened/saved settings file (no automatic persistence)
+        self._current_settings_file = None
+        self._bad_words_path = None
+        
+        # Initialize automation manager BEFORE building the tab
+        self.automation_manager = AutomationManager()
+        self.automation_manager.set_callbacks(
+            on_start=self._on_automation_start,
+            on_stop=self._on_automation_stop
+        )
+
+        # If the GUI was started with simulation enabled, schedule a
+        # synthetic automation start/stop to demonstrate UI feedback.
+        self._simulate_automation = bool(simulate_automation)
+        if self._simulate_automation:
+            try:
+                # Start after 1 second, stop after 7 seconds (gives time
+                # for model start UI to be visible).
+                self.safe_after(1000, lambda: self._on_automation_start())
+                self.safe_after(7000, lambda: self._on_automation_stop())
+            except Exception:
+                pass
+
         # Noise cancellation tab (Hance integration)
         self.noise_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.noise_frame, text="Noise Cancelation")
@@ -233,10 +286,77 @@ class App(tk.Tk):
             pass
         self._build_noise_tab()
 
-        self.engine: CaptionEngine | None = None
-        # session state for opened/saved settings file (no automatic persistence)
-        self._current_settings_file = None
-        self._bad_words_path = None
+        # Automations tab
+        self.automations_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.automations_frame, text="Automations")
+
+        try:
+            if self._splash:
+                self._splash.update_status("Building automations tab...")
+        except Exception:
+            pass
+        self._build_automations_tab()
+
+    def quit(self):
+        """Override quit to ensure clean shutdown of automation scheduler and engine."""
+        try:
+            # Stop the capture engine if running
+            if getattr(self, 'engine', None):
+                try:
+                    if self.engine and self.engine.running:
+                        self.engine.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
+        try:
+            # Stop automation scheduler gracefully
+            if getattr(self, 'automation_manager', None):
+                try:
+                    self.automation_manager.stop_scheduler()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        
+        # Give threads a moment to finish
+        try:
+            import time
+            time.sleep(0.5)
+        except Exception:
+            pass
+        
+        # Destroy the window to fully close the app
+        try:
+            self.destroy()
+        except Exception:
+            # Fallback to quit if destroy fails
+            super().quit()
+
+    def safe_after(self, delay, func, *args):
+        """Call after() only if the window still exists."""
+        try:
+            if self.winfo_exists():
+                return tk.Tk.after(self, delay, func, *args)
+        except Exception:
+            pass
+        return None
+
+    def _log_button_states(self, reason: str = ""):
+        """Lightweight debug print of Start/Stop button states."""
+        try:
+            s = self.start_btn['state']
+        except Exception:
+            s = 'unknown'
+        try:
+            t = self.stop_btn['state']
+        except Exception:
+            t = 'unknown'
+        try:
+            print(f"[UI] {reason} start={s} stop={t}")
+        except Exception:
+            pass
 
     def _build_main_tab(self):
         # Left: transcript (3/4)
@@ -270,9 +390,18 @@ class App(tk.Tk):
         self.model_entry = ttk.Entry(model_frame, textvariable=self.model_path_var)
         self.model_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(model_frame, text="Browse...", command=self._browse_model).pack(side=tk.RIGHT, padx=(6, 0))
+        # Punctuator selection (optional) - look for folders starting with 'vosk-recasepunc'
+        ttk.Label(right, text="Punctuator (vosk-recasepunc...):").pack(pady=(8, 2), padx=8, anchor=tk.W)
+        punct_frame = ttk.Frame(right)
+        punct_frame.pack(padx=8, fill=tk.X)
+        self.punctuator_var = tk.StringVar()
+        self.punctuator_entry = ttk.Entry(punct_frame, textvariable=self.punctuator_var)
+        self.punctuator_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(punct_frame, text="Browse...", command=self._browse_punctuator).pack(side=tk.RIGHT, padx=(6, 0))
         # Model status label
         self.model_status_var = tk.StringVar(value="Model: (not selected) - Demo mode")
         ttk.Label(right, textvariable=self.model_status_var, wraplength=220).pack(padx=8, pady=(6, 0), anchor=tk.W)
+        # (Optional recase/punctuation UI removed - using plain Vosk model selection)
         # CPU threads control
         ttk.Label(right, text="CPU threads:").pack(pady=(8, 2), padx=8, anchor=tk.W)
         self.cpu_threads_var = tk.IntVar(value=0)
@@ -283,7 +412,7 @@ class App(tk.Tk):
         ttk.Label(right, textvariable=self.thread_status_var).pack(padx=8, pady=(4, 8), anchor=tk.W)
         # Speaker ID / profile matching controls
         ttk.Label(right, text="Speaker ID (Voice Profiles):").pack(pady=(8, 2), padx=8, anchor=tk.W)
-        self.profile_matching_var = tk.BooleanVar(value=True)
+        self.profile_matching_var = tk.BooleanVar(value=False)
         self.profile_matching_chk = ttk.Checkbutton(right, text="Enable speaker matching", variable=self.profile_matching_var)
         self.profile_matching_chk.pack(padx=8, anchor=tk.W)
 
@@ -340,6 +469,12 @@ class App(tk.Tk):
         try:
             self.noise_chk = ttk.Checkbutton(right, text="Enable Noise Cancelation", variable=self.noise_enabled_var, command=self._on_toggle_noise)
             self.noise_chk.pack(padx=8, anchor=tk.W, pady=(6,8))
+            # Disable noise controls for non-commercial (personal/eval) mode
+            try:
+                if not getattr(self, '_is_commercial', False):
+                    self.noise_chk.config(state=tk.DISABLED)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -517,8 +652,8 @@ class App(tk.Tk):
             # Mouse wheel (Windows)
             self.transcript.bind('<MouseWheel>', self._on_user_scroll)
             # Linux scroll
-            self.transcript.bind('<Button-4>', self._on_user_scroll)
-            self.transcript.bind('<Button-5>', self._on_user_scroll)
+            # self.transcript.bind('<Button-4>', self._on_user_scroll)
+            # self.transcript.bind('<Button-5>', self._on_user_scroll)
             # Scrollbar drag
             self.transcript_scroll.bind('<ButtonPress-1>', self._on_user_scroll)
             self.transcript_scroll.bind('<B1-Motion>', self._on_user_scroll)
@@ -654,6 +789,37 @@ class App(tk.Tk):
         if path:
             self.model_path_var.set(path)
             self._update_model_status()
+    # recase UI and helpers removed
+
+    def _is_valid_punctuator(self, path: str) -> bool:
+        """Return True if `path` is a directory and its basename starts with 'vosk-recasepunc'."""
+        try:
+            if not path:
+                return False
+            if not os.path.isdir(path):
+                return False
+            base = os.path.basename(os.path.normpath(path))
+            return base.lower().startswith('vosk-recasepunc')
+        except Exception:
+            return False
+
+    def _browse_punctuator(self):
+        try:
+            start = self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else self.models_root
+            if not start:
+                start = self.models_root
+            path = filedialog.askdirectory(title="Select punctuator folder (vosk-recasepunc...)", initialdir=start)
+            if not path:
+                return
+            if not self._is_valid_punctuator(path):
+                messagebox.showerror("Punctuator", "Selected folder does not appear to be a 'vosk-recasepunc' model folder.")
+                return
+            self.punctuator_var.set(path)
+        except Exception as e:
+            try:
+                messagebox.showerror("Punctuator", f"Failed to select punctuator: {e}")
+            except Exception:
+                pass
 
     def _is_valid_model(self, path: str) -> bool:
         """Quick heuristic: check for common VOSK model files/folders."""
@@ -873,6 +1039,11 @@ class App(tk.Tk):
                 data['bad_words'] = self._bad_words_path if getattr(self, '_bad_words_path', None) else ''
             except Exception:
                 data['bad_words'] = ''
+            # include punctuator path if set (optional)
+            try:
+                data['punctuator_path'] = self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else ''
+            except Exception:
+                data['punctuator_path'] = ''
             # Convert file paths to relative when they sit under the project root
             try:
                 base = os.path.abspath(os.path.dirname(__file__))
@@ -891,14 +1062,57 @@ class App(tk.Tk):
                         return p
 
                 # apply to known path-like keys
-                if 'model_path' in data:
-                    data['model_path'] = _maybe_rel(data.get('model_path', ''))
+                # Convert file paths to relative when they sit under the project root
+                try:
+                    base = os.path.abspath(os.path.dirname(__file__))
+                    def _maybe_rel(p):
+                        if not p:
+                            return ''
+                        try:
+                            full = os.path.abspath(p)
+                            # normalize for case-insensitive filesystems
+                            base_n = os.path.normcase(base)
+                            full_n = os.path.normcase(full)
+                            if full_n == base_n or full_n.startswith(base_n + os.sep):
+                                return os.path.relpath(full, base).replace('\\', '/')
+                            return full
+                        except Exception:
+                            return p
+
+                    # apply to known path-like keys
+                    if 'model_path' in data:
+                        data['model_path'] = _maybe_rel(data.get('model_path', ''))
+                    # punctuator path
+                    if 'punctuator_path' in data:
+                        data['punctuator_path'] = _maybe_rel(data.get('punctuator_path', ''))
+                    # recase_path removed from settings
+                    if 'custom_vocab_data_dir' in data:
+                        data['custom_vocab_data_dir'] = _maybe_rel(data.get('custom_vocab_data_dir', ''))
+                    if 'bad_words' in data:
+                        data['bad_words'] = _maybe_rel(data.get('bad_words', ''))
+                except Exception:
+                    pass
                 if 'custom_vocab_data_dir' in data:
                     data['custom_vocab_data_dir'] = _maybe_rel(data.get('custom_vocab_data_dir', ''))
                 if 'bad_words' in data:
                     data['bad_words'] = _maybe_rel(data.get('bad_words', ''))
             except Exception:
                 pass
+            
+            # include automation data
+            try:
+                if getattr(self, 'automation_manager', None):
+                    data['automations'] = self.automation_manager.to_dict()
+            except Exception:
+                pass
+            
+            # include auto-save settings
+            try:
+                data['auto_save_txt'] = bool(self.auto_save_txt_var.get()) if getattr(self, 'auto_save_txt_var', None) is not None else False
+                data['auto_save_txt_path'] = self.auto_save_txt_path if getattr(self, 'auto_save_txt_path', None) else ''
+            except Exception:
+                pass
+            
             return data
         except Exception:
             return {}
@@ -982,6 +1196,17 @@ class App(tk.Tk):
                     except Exception:
                         pass
                     self.model_path_var.set(model)
+                    # optional punctuator path
+                    punc = data.get('punctuator_path')
+                    if punc:
+                        try:
+                            if not os.path.isabs(punc):
+                                punc = os.path.join(base, punc)
+                            punc = os.path.abspath(punc)
+                        except Exception:
+                            pass
+                        self.punctuator_var.set(punc)
+                # recase path handling removed
                 self.cpu_threads_var.set(int(data.get("cpu_threads", 0)))
                 self.serial_enabled_var.set(bool(data.get("serial_enabled", False)))
                 # profile matching settings (optional)
@@ -1173,6 +1398,40 @@ class App(tk.Tk):
                                 pass
                         except Exception:
                             pass
+                except Exception:
+                    pass
+                
+                # If the settings file contained automations, restore them
+                try:
+                    automations_data = data.get('automations')
+                    if automations_data and getattr(self, 'automation_manager', None):
+                        self.automation_manager = AutomationManager.from_dict(automations_data)
+                        self.automation_manager.set_callbacks(
+                            on_start=self._on_automation_start,
+                            on_stop=self._on_automation_stop
+                        )
+                        # Refresh the automations tab UI to show loaded automations
+                        try:
+                            self._refresh_automations_display()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                
+                # Restore auto-save settings if present
+                try:
+                    auto_save_enabled = data.get('auto_save_txt', False)
+                    if getattr(self, 'auto_save_txt_var', None) is not None:
+                        self.auto_save_txt_var.set(bool(auto_save_enabled))
+                    auto_save_path = data.get('auto_save_txt_path', '')
+                    if auto_save_path:
+                        try:
+                            if not os.path.isabs(auto_save_path):
+                                auto_save_path = os.path.join(base, auto_save_path)
+                            auto_save_path = os.path.abspath(auto_save_path)
+                        except Exception:
+                            pass
+                        self.auto_save_txt_path = auto_save_path
                 except Exception:
                     pass
             except Exception:
@@ -1496,6 +1755,50 @@ class App(tk.Tk):
         except Exception:
             pass
 
+        # Auto-save settings section
+        separator = ttk.Separator(frm, orient='horizontal')
+        separator.pack(fill=tk.X, pady=(12, 6))
+
+        auto_save_lbl = ttk.Label(frm, text="Auto-Save Transcript Settings", font=('', 10, 'bold'))
+        auto_save_lbl.pack(anchor=tk.W, pady=(4, 6))
+
+        # Auto-save checkbox
+        auto_save_chk_frm = ttk.Frame(frm)
+        auto_save_chk_frm.pack(fill=tk.X, pady=(2, 4))
+        try:
+            ttk.Checkbutton(auto_save_chk_frm, text="Auto-save transcript when show completes", 
+                           variable=self.auto_save_txt_var).pack(anchor=tk.W)
+        except Exception:
+            pass
+
+        # Save location frame
+        save_loc_frm = ttk.Frame(frm)
+        save_loc_frm.pack(fill=tk.X, pady=(4, 4))
+        ttk.Label(save_loc_frm, text="Save location:").pack(anchor=tk.W)
+
+        path_frm = ttk.Frame(frm)
+        path_frm.pack(fill=tk.X, pady=(2, 4))
+        path_var = tk.StringVar(value=self.auto_save_txt_path)
+        try:
+            ttk.Entry(path_frm, textvariable=path_var, width=50).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        except Exception:
+            pass
+
+        def _browse_save_location():
+            try:
+                from tkinter import filedialog
+                folder = filedialog.askdirectory(title="Select auto-save location", initialdir=self.auto_save_txt_path)
+                if folder:
+                    path_var.set(folder)
+                    self.auto_save_txt_path = folder
+            except Exception:
+                pass
+
+        try:
+            ttk.Button(path_frm, text="Browse", command=_browse_save_location).pack(side=tk.LEFT)
+        except Exception:
+            pass
+
         def on_cancel():
             try:
                 dlg.destroy()
@@ -1528,6 +1831,12 @@ class App(tk.Tk):
                 mask_char = '*'
             try:
                 mainmod.BLEEP_SETTINGS = {'mode': mode, 'custom_text': custom_text, 'mask_char': mask_char}
+            except Exception:
+                pass
+            # Save auto-save settings
+            try:
+                self.auto_save_txt_var.set(path_var.get() != '')  # checkbox tied to whether path is set
+                self.auto_save_txt_path = path_var.get()
             except Exception:
                 pass
             try:
@@ -1728,7 +2037,7 @@ class App(tk.Tk):
                 except Exception as e:
                     models_by_lang = {}
                     status = f"Failed to fetch models: {e}"
-                    self.after(0, lambda: status_var.set(status))
+                    self.safe_after(0, lambda: status_var.set(status))
                 finally:
                     def ui_done():
                         progress.stop()
@@ -1737,7 +2046,7 @@ class App(tk.Tk):
                         langs = sorted(models_by_lang.keys())
                         _populate_languages(langs)
                         status_var.set(f"Loaded {sum(len(v) for v in models_by_lang.values())} models across {len(langs)} languages")
-                    self.after(0, ui_done)
+                    self.safe_after(0, ui_done)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1874,7 +2183,7 @@ class App(tk.Tk):
                                         os.remove(tmp_path)
                                     except Exception:
                                         pass
-                                    self.after(0, lambda: status_var.set('Download cancelled'))
+                                    self.safe_after(0, lambda: status_var.set('Download cancelled'))
                                     return
                                 if not chunk:
                                     continue
@@ -1884,7 +2193,7 @@ class App(tk.Tk):
                                     pct = int(written * 100 / total)
                                 else:
                                     pct = 0
-                                self.after(0, lambda p=pct: progress.config(value=p))
+                                self.safe_after(0, lambda p=pct: progress.config(value=p))
                         try:
                             os.replace(tmp_path, dest_path)
                         except Exception:
@@ -1895,12 +2204,12 @@ class App(tk.Tk):
                             pass
                     # extraction
                     status = 'Download complete. Extracting...'
-                    self.after(0, lambda: status_var.set(status))
+                    self.safe_after(0, lambda: status_var.set(status))
                     extract_to = dest_dir
                     try:
                         self._extract_archive(dest_path, extract_to)
                     except Exception as e:
-                        self.after(0, lambda: messagebox.showerror('Vosk Models', f'Extraction failed: {e}'))
+                        self.safe_after(0, lambda: messagebox.showerror('Vosk Models', f'Extraction failed: {e}'))
                         return
                     # Only remove the downloaded archive if extraction succeeded;
                     # otherwise keep the model file (e.g., .hance) in place.
@@ -1953,12 +2262,12 @@ class App(tk.Tk):
                                     target = found_folder
                         except Exception:
                             target = found_folder
-                        self.after(0, lambda: [self.model_path_var.set(target), self._update_model_status(), status_var.set(f'Installed: {os.path.basename(target)}')])
+                        self.safe_after(0, lambda: [self.model_path_var.set(target), self._update_model_status(), status_var.set(f'Installed: {os.path.basename(target)}')])
                     else:
-                        self.after(0, lambda: status_var.set('Extraction complete but model folder not found; please browse manually'))
+                        self.safe_after(0, lambda: status_var.set('Extraction complete but model folder not found; please browse manually'))
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror('Vosk Models', f'Download failed: {e}'))
-                    self.after(0, lambda: status_var.set('Download failed'))
+                    self.safe_after(0, lambda: messagebox.showerror('Vosk Models', f'Download failed: {e}'))
+                    self.safe_after(0, lambda: status_var.set('Download failed'))
                 finally:
                     # clear cancel event and thread
                     try:
@@ -1967,7 +2276,7 @@ class App(tk.Tk):
                             self._model_download_cancel_event = None
                     except Exception:
                         pass
-                    self.after(0, lambda: progress.config(value=0))
+                    self.safe_after(0, lambda: progress.config(value=0))
 
             threading.Thread(target=worker_download, daemon=True).start()
 
@@ -1997,7 +2306,7 @@ class App(tk.Tk):
                 messagebox.showerror('Vosk Models', 'Selected model is not installed')
                 return
             # Set model path to installed folder and update status
-            self.after(0, lambda: [self.model_path_var.set(target), self._update_model_status(), status_var.set(f'Selected installed: {os.path.basename(target)}'), dlg.destroy()])
+            self.safe_after(0, lambda: [self.model_path_var.set(target), self._update_model_status(), status_var.set(f'Selected installed: {os.path.basename(target)}'), dlg.destroy()])
 
         def _on_tree_select(evt=None):
             # enable/disable select button depending on whether the selected
@@ -2205,7 +2514,7 @@ class App(tk.Tk):
                     models_list = items
                 except Exception as e:
                     models_list = []
-                    self.after(0, lambda: status_var.set(f"Failed to fetch models: {e}"))
+                    self.safe_after(0, lambda: status_var.set(f"Failed to fetch models: {e}"))
                 finally:
                     def ui_done():
                         progress.stop()
@@ -2213,7 +2522,7 @@ class App(tk.Tk):
                         _clear_models_view()
                         _populate_models()
                         status_var.set(f"Loaded {len(models_list)} Hance model(s)")
-                    self.after(0, ui_done)
+                    self.safe_after(0, ui_done)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -2272,7 +2581,7 @@ class App(tk.Tk):
                                         os.remove(tmp_path)
                                     except Exception:
                                         pass
-                                    self.after(0, lambda: status_var.set('Download cancelled'))
+                                    self.safe_after(0, lambda: status_var.set('Download cancelled'))
                                     return
                                 if not chunk:
                                     continue
@@ -2282,14 +2591,14 @@ class App(tk.Tk):
                                     pct = int(written * 100 / total)
                                 else:
                                     pct = 0
-                                self.after(0, lambda p=pct: progress.config(value=p))
+                                self.safe_after(0, lambda p=pct: progress.config(value=p))
                         try:
                             os.replace(tmp_path, dest_path)
                         except Exception:
                             shutil.move(tmp_path, dest_path)
                     # extraction if archive
                     status = 'Download complete. Extracting if needed...'
-                    self.after(0, lambda: status_var.set(status))
+                    self.safe_after(0, lambda: status_var.set(status))
                     was_extracted = False
                     try:
                         archive_exts = ('.zip', '.tar.gz', '.tgz', '.tar', '.tar.bz2', '.tar.xz', '.7z')
@@ -2357,17 +2666,17 @@ class App(tk.Tk):
                             _hlog(f"Found installed model path: {found}")
                         except Exception:
                             pass
-                        self.after(0, lambda: [self.hance_model_var.set(found), status_var.set(f'Installed: {os.path.basename(found)}')])
+                        self.safe_after(0, lambda: [self.hance_model_var.set(found), status_var.set(f'Installed: {os.path.basename(found)}')])
                     else:
-                        self.after(0, lambda: status_var.set('Installed but model file not found; please browse manually'))
+                        self.safe_after(0, lambda: status_var.set('Installed but model file not found; please browse manually'))
                         try:
                             _hlog(f"Model install not found after download. dest_dir={dest_dir}, fname={fname}, name={name}")
                             _hlog(f"Models dir listing: {list(os.listdir(dest_dir))}")
                         except Exception:
                             pass
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror('Hance Models', f'Download failed: {e}'))
-                    self.after(0, lambda: status_var.set('Download failed'))
+                    self.safe_after(0, lambda: messagebox.showerror('Hance Models', f'Download failed: {e}'))
+                    self.safe_after(0, lambda: status_var.set('Download failed'))
                 finally:
                     try:
                         self._model_download_thread = None
@@ -2375,7 +2684,7 @@ class App(tk.Tk):
                             self._model_download_cancel_event = None
                     except Exception:
                         pass
-                    self.after(0, lambda: progress.config(value=0))
+                    self.safe_after(0, lambda: progress.config(value=0))
 
             threading.Thread(target=worker_download, daemon=True).start()
 
@@ -2404,7 +2713,7 @@ class App(tk.Tk):
             if not target:
                 messagebox.showerror('Hance Models', 'Selected model is not installed')
                 return
-            self.after(0, lambda: [self.hance_model_var.set(target), self.noise_status_var.set(f"Installed (model:{os.path.basename(target)})"), dlg.destroy()])
+            self.safe_after(0, lambda: [self.hance_model_var.set(target), self.noise_status_var.set(f"Installed (model:{os.path.basename(target)})"), dlg.destroy()])
 
         def _on_tree_select(evt=None):
             sel = models_tree.selection()
@@ -2672,19 +2981,19 @@ class App(tk.Tk):
                         pass
                     # notify main thread of cancellation via on_error if provided
                     if on_error:
-                        self.after(0, lambda: on_error("cancelled"))
+                        self.safe_after(0, lambda: on_error("cancelled"))
                     return
 
                 # otherwise notify success on main thread
                 if on_started:
-                    self.after(0, lambda: on_started())
+                    self.safe_after(0, lambda: on_started())
             except Exception as e:
                 # pass exception message to UI thread
                 if on_error:
-                    self.after(0, lambda: on_error(str(e)))
+                    self.safe_after(0, lambda: on_error(str(e)))
                 else:
                     try:
-                        self.after(0, lambda: messagebox.showerror("Engine start failed", str(e)))
+                        self.safe_after(0, lambda: messagebox.showerror("Engine start failed", str(e)))
                     except Exception:
                         pass
 
@@ -2701,21 +3010,39 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        try:
+            self._log_button_states("start_capture entry - after device selection")
+        except Exception:
+            pass
+
         if self.engine and getattr(self.engine, "_thread", None) and self.engine._thread.is_alive():
+            try:
+                print("[UI] start_capture: engine already running, returning")
+            except Exception:
+                pass
             return
         # Determine model selection
         model_path = self.model_path_var.get().strip()
+        try:
+            print(f"[UI] start_capture: model_path='{model_path}', suppress_demo={getattr(self, '_suppress_demo_prompt', False)}")
+        except Exception:
+            pass
         demo = False
         cpu_threads = int(self.cpu_threads_var.get() or 0)
         if not model_path or not os.path.isdir(model_path) or not self._is_valid_model(model_path):
-            # Ask the user whether to run demo mode
-            use_demo = messagebox.askyesno(
-                "No valid model selected",
-                "No valid VOSK model selected or path not found/invalid. Do you want to use demo mode?",
-            )
-            if not use_demo:
-                return
-            demo = True
+            # If this start was initiated by an automation, silently
+            # enable demo mode instead of prompting the user.
+            if getattr(self, '_suppress_demo_prompt', False):
+                demo = True
+            else:
+                # Ask the user whether to run demo mode
+                use_demo = messagebox.askyesno(
+                    "No valid model selected",
+                    "No valid VOSK model selected or path not found/invalid. Do you want to use demo mode?",
+                )
+                if not use_demo:
+                    return
+                demo = True
 
         # Create engine instance (heavy work happens in engine.start())
         self.engine = CaptionEngine(
@@ -2724,7 +3051,15 @@ class App(tk.Tk):
             cpu_threads=(cpu_threads if cpu_threads > 0 else None),
             enable_profile_matching=bool(self.profile_matching_var.get()),
             profile_match_threshold=float(self.profile_threshold_var.get()),
+            punctuator=(self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else None),
         )
+
+        try:
+            print("[UI] start_capture: created CaptionEngine, about to show loading dialog and start async")
+        except Exception:
+            pass
+
+        # Recase subprocess integration removed (using plain Vosk model only)
 
         # Show a modal loading dialog and start the engine in a background thread
         try:
@@ -2734,7 +3069,11 @@ class App(tk.Tk):
             pb = None
             cancel_evt = None
 
+        # Flag to indicate the on_started callback ran
+        _started_flag = {'ok': False}
+
         def _on_started():
+            _started_flag['ok'] = True
             try:
                 if pb:
                     pb.stop()
@@ -2758,6 +3097,10 @@ class App(tk.Tk):
                 self.start_btn.config(state=tk.DISABLED)
                 self.stop_btn.config(state=tk.NORMAL)
                 self.device_combo.config(state=tk.DISABLED)
+            except Exception:
+                pass
+            try:
+                self._log_button_states("engine started (_on_started)")
             except Exception:
                 pass
 
@@ -2786,19 +3129,80 @@ class App(tk.Tk):
             except Exception:
                 pass
             try:
+                self._log_button_states("engine scheduling failed (start exception)")
+            except Exception:
+                pass
+            try:
+                self._log_button_states("engine start error (_on_error)")
+            except Exception:
+                pass
+            try:
                 self.engine = None
             except Exception:
                 pass
-
         # start engine asynchronously; _start_engine_async will call engine.start()
-        self._start_engine_async(self.engine, on_started=_on_started, on_error=_on_error, cancel_event=cancel_evt)
+        try:
+            self._start_engine_async(self.engine, on_started=_on_started, on_error=_on_error, cancel_event=cancel_evt)
+        except Exception:
+            # If scheduling the start failed immediately, ensure UI is not left disabled
+            try:
+                self.start_btn.config(state=tk.NORMAL)
+                self.stop_btn.config(state=tk.DISABLED)
+                self.device_combo.config(state="readonly")
+            except Exception:
+                pass
+
+        # Watchdog: if model start doesn't call _on_started within 30s, restore UI
+        def _start_watchdog():
+            try:
+                if not _started_flag.get('ok'):
+                    # Attempt to stop any partially-started engine
+                    try:
+                        if getattr(self, 'engine', None) is not None:
+                            try:
+                                self.engine.stop()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # Restore controls so user can try again
+                    try:
+                        self.start_btn.config(state=tk.NORMAL)
+                        self.stop_btn.config(state=tk.DISABLED)
+                        self.device_combo.config(state="readonly")
+                    except Exception:
+                        pass
+                    try:
+                        self._log_button_states("engine start watchdog restored UI")
+                    except Exception:
+                        pass
+                    try:
+                        # update status so user knows something went wrong
+                        self.model_status_var.set("Model: start timed out or failed")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            # 30s timeout to detect stuck loads
+            self.safe_after(30000, _start_watchdog)
+        except Exception:
+            pass
 
     def stop_capture(self):
         if self.engine:
-            self.engine.stop()
+            try:
+                self.engine.stop()
+            except Exception:
+                pass
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.device_combo.config(state="readonly")
+        try:
+            self._log_button_states("stop_capture")
+        except Exception:
+            pass
 
     def _on_caption(self, text: str):
         # ensure called in main thread
@@ -2815,6 +3219,10 @@ class App(tk.Tk):
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
                 self.device_combo.config(state="readonly")
+                try:
+                    self._log_button_states("_on_caption reported [ERROR]")
+                except Exception:
+                    pass
                 return
 
             self.transcript.insert(tk.END, text + "\n")
@@ -2836,7 +3244,7 @@ class App(tk.Tk):
                 pass
 
         try:
-            self.after(0, _handle)
+            self.safe_after(0, _handle)
         except RuntimeError:
             # No Tk main loop is running (headless test). Call handler directly
             try:
@@ -2976,7 +3384,7 @@ class App(tk.Tk):
         # tab focused on model and installation controls.
 
         # Hance model selection
-        ttk.Label(left, text="Hance model file: (optional)").pack(anchor=tk.W, pady=(8,2))
+        ttk.Label(left, text="Hance model file:").pack(anchor=tk.W, pady=(8,2))
         model_frame = ttk.Frame(left)
         model_frame.pack(fill=tk.X)
         self.hance_model_var = tk.StringVar()
@@ -2997,6 +3405,33 @@ class App(tk.Tk):
 
         # Helpful note
         ttk.Label(left, text="Note: Hance SDK integration is attempted if available; otherwise a simple fallback noise gate is used.").pack(anchor=tk.W, pady=(6,0))
+
+        # If not commercial, disable Hance/Noise controls and mark as unavailable
+        try:
+            if not getattr(self, '_is_commercial', False):
+                try:
+                    self.hance_model_entry.config(state='disabled')
+                except Exception:
+                    pass
+                try:
+                    self.load_hance_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.unload_hance_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    # ensure noise is off
+                    self.noise_enabled_var.set(False)
+                except Exception:
+                    pass
+                try:
+                    self.noise_status_var.set("Disabled in Personal/Eval mode")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _browse_hance_model(self):
         path = filedialog.askopenfilename(title="Select Hance model file", filetypes=[('All files','*.*')])
@@ -3038,6 +3473,745 @@ class App(tk.Tk):
             self._install_noise()
         else:
             self._uninstall_noise()
+
+    def refresh_license_state(self):
+        """Refresh license status at runtime and enable/disable gated features.
+
+        Call this after activation to enable commercial features without restart.
+        """
+        try:
+            import license_manager
+            is_commercial = (license_manager.license_type() == 'commercial')
+        except Exception:
+            is_commercial = False
+        try:
+            old = getattr(self, '_is_commercial', False)
+            self._is_commercial = bool(is_commercial)
+            self._automations_allowed = bool(is_commercial)
+        except Exception:
+            pass
+
+        # Noise controls
+        try:
+            if is_commercial:
+                try:
+                    self.noise_chk.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                try:
+                    self.hance_model_entry.config(state='normal')
+                except Exception:
+                    pass
+                try:
+                    self.load_hance_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                try:
+                    self.unload_hance_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                # if previously disabled, clear status message
+                try:
+                    if (not old) and (not self.noise_status_var.get() or 'Disabled in Personal' in self.noise_status_var.get()):
+                        self.noise_status_var.set('Not installed')
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.noise_chk.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.hance_model_entry.config(state='disabled')
+                except Exception:
+                    pass
+                try:
+                    self.load_hance_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.unload_hance_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.noise_enabled_var.set(False)
+                except Exception:
+                    pass
+                try:
+                    self.noise_status_var.set('Disabled in Personal/Eval mode')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Automations controls
+        try:
+            if is_commercial:
+                try:
+                    self.add_automation_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                try:
+                    self.apply_automations_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+                # Remove the "disabled in Personal/Eval mode" label if present
+                try:
+                    if getattr(self, '_automations_disabled_label', None):
+                        self._automations_disabled_label.destroy()
+                        self._automations_disabled_label = None
+                except Exception:
+                    pass
+                # refresh display and start scheduler if automations present
+                try:
+                    self._refresh_automations_display()
+                except Exception:
+                    pass
+                try:
+                    if self.automation_manager.get_automations():
+                        try:
+                            self.automation_manager.start_scheduler()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.add_automation_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.apply_automations_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.automation_manager.stop_scheduler()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _build_automations_tab(self):
+        """Build the Automations tab for scheduling show automation."""
+        frm = ttk.Frame(self.automations_frame, padding=8)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        # Top controls frame
+        controls_frm = ttk.Frame(frm)
+        controls_frm.pack(fill=tk.X, pady=(0, 6))
+        
+        ttk.Label(controls_frm, text="Show Automations:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        
+        # Add show button
+        self.add_automation_btn = ttk.Button(controls_frm, text="+ Add Show", command=self._on_add_automation)
+        self.add_automation_btn.pack(side=tk.LEFT, padx=(0, 4))
+        
+        self.apply_automations_btn = ttk.Button(controls_frm, text="Apply", command=self._on_apply_automations)
+        self.apply_automations_btn.pack(side=tk.LEFT)
+
+        # If automations are not allowed for this license, disable controls
+        self._automations_disabled_label = None
+        try:
+            if not getattr(self, '_automations_allowed', False):
+                try:
+                    self.add_automation_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self.apply_automations_btn.config(state=tk.DISABLED)
+                except Exception:
+                    pass
+                try:
+                    self._automations_disabled_label = ttk.Label(frm, text="Automations disabled in Personal/Eval mode.")
+                    self._automations_disabled_label.pack(pady=(8,8))
+                except Exception:
+                    pass
+                # further UI population will still run but controls are disabled
+        except Exception:
+            pass
+
+        # Main scrollable frame for automations
+        canvas_frm = ttk.Frame(frm)
+        canvas_frm.pack(fill=tk.BOTH, expand=True)
+        
+        self.automations_canvas = tk.Canvas(canvas_frm, bg='white', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frm, orient=tk.VERTICAL, command=self.automations_canvas.yview)
+        self.automations_scrollable_frm = ttk.Frame(self.automations_canvas)
+        
+        self.automations_scrollable_frm.bind(
+            "<Configure>",
+            lambda e: self._on_automations_configure(e)
+        )
+        
+        self.automations_canvas.create_window((0, 0), window=self.automations_scrollable_frm, anchor="nw")
+        self.automations_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.automations_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.automations_scrollbar = scrollbar
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Bind mouse wheel to canvas (only scroll if content overflows)
+        def _on_mousewheel(event):
+            try:
+                canvas_height = self.automations_canvas.winfo_height()
+                bbox = self.automations_canvas.bbox("all")
+                scroll_height = bbox[3] if bbox else 0
+                # Only scroll if content is taller than canvas
+                if scroll_height > canvas_height:
+                    self.automations_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            except Exception:
+                pass
+        self.automations_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Store automation entry widgets for easy access
+        self.automation_entries = []
+        
+        # Initialize with empty list
+        self._refresh_automations_display()
+
+    def _on_automations_configure(self, event):
+        """Handle canvas configuration and update scrollbar visibility."""
+        self.automations_canvas.configure(scrollregion=self.automations_canvas.bbox("all"))
+        # Check if scrolling is needed
+        try:
+            canvas_height = self.automations_canvas.winfo_height()
+            scroll_height = self.automations_canvas.bbox("all")[3] if self.automations_canvas.bbox("all") else 0
+            if scroll_height <= canvas_height:
+                # No scrolling needed, hide scrollbar and disable scrolling
+                self.automations_scrollbar.pack_forget()
+            else:
+                # Scrolling needed, show scrollbar
+                self.automations_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        except Exception:
+            pass
+
+    def _refresh_automations_display(self):
+        """Refresh the display of automation entries."""
+        # Clear existing entries
+        for child in self.automations_scrollable_frm.winfo_children():
+            child.destroy()
+        self.automation_entries = []
+        
+        # Add entries for each automation
+        for i, automation in enumerate(self.automation_manager.get_automations()):
+            self._add_automation_entry_widget(automation, i)
+        
+        # If no automations, show placeholder
+        if not self.automation_manager.get_automations():
+            placeholder = ttk.Label(self.automations_scrollable_frm, text="No shows configured. Click '+ Add Show' to get started.", foreground="gray")
+            placeholder.pack(fill=tk.X, padx=4, pady=4)
+        
+        # Update scrollbar visibility
+        self.automations_canvas.update_idletasks()
+
+    def _add_automation_entry_widget(self, automation: ShowAutomation | None = None, index: int | None = None):
+        """Add a single automation entry widget to the display."""
+        if index is None:
+            index = len(self.automation_entries)
+        
+        entry_frm = ttk.LabelFrame(self.automations_scrollable_frm, text=f"Show {index + 1}", padding=8)
+        entry_frm.pack(fill=tk.X, padx=4, pady=4)
+        
+        # Show name
+        name_frm = ttk.Frame(entry_frm)
+        name_frm.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(name_frm, text="Show Name:").pack(side=tk.LEFT, padx=(0, 4))
+        name_var = tk.StringVar(value=automation.name if automation else "")
+        name_entry = ttk.Entry(name_frm, textvariable=name_var, width=20)
+        name_entry.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Days of week checkboxes
+        days_frm = ttk.Frame(entry_frm)
+        days_frm.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(days_frm, text="Days:").pack(side=tk.LEFT, padx=(0, 4))
+        
+        days_list = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        day_vars = {}
+        for day in days_list:
+            var = tk.BooleanVar(value=(day in automation.days if automation else False))
+            day_vars[day] = var
+            chk = ttk.Checkbutton(days_frm, text=day[:3], variable=var)
+            chk.pack(side=tk.LEFT, padx=2)
+        
+        # Time selection - Start time (3 dropdowns)
+        start_time_frm = ttk.Frame(entry_frm)
+        start_time_frm.pack(fill=tk.X, pady=(0, 6))
+        
+        ttk.Label(start_time_frm, text="Start:").pack(side=tk.LEFT, padx=(0, 4))
+        
+        # Parse existing start time or use defaults
+        if automation and automation.start_time:
+            start_parts = self._parse_time_string(automation.start_time)
+        else:
+            start_parts = {'hour': '12', 'minute': '00', 'period': 'PM'}
+        
+        start_hour_var = tk.StringVar(value=start_parts['hour'])
+        start_hour_combo = ttk.Combobox(start_time_frm, textvariable=start_hour_var, values=self._get_hour_options(), width=2, state="readonly")
+        start_hour_combo.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(start_time_frm, text=":").pack(side=tk.LEFT, padx=2)
+        
+        start_minute_var = tk.StringVar(value=start_parts['minute'])
+        start_minute_combo = ttk.Combobox(start_time_frm, textvariable=start_minute_var, values=self._get_minute_options(), width=2, state="readonly")
+        start_minute_combo.pack(side=tk.LEFT, padx=2)
+        
+        start_period_var = tk.StringVar(value=start_parts['period'])
+        start_period_combo = ttk.Combobox(start_time_frm, textvariable=start_period_var, values=['AM', 'PM'], width=2, state="readonly")
+        start_period_combo.pack(side=tk.LEFT, padx=(2, 20))
+        
+        # Time selection - End time (3 dropdowns)
+        end_time_frm = ttk.Frame(entry_frm)
+        end_time_frm.pack(fill=tk.X, pady=(0, 6))
+        
+        ttk.Label(end_time_frm, text="End:").pack(side=tk.LEFT, padx=(0, 4))
+        
+        # Parse existing end time or use defaults
+        if automation and automation.end_time:
+            end_parts = self._parse_time_string(automation.end_time)
+        else:
+            end_parts = {'hour': '1', 'minute': '00', 'period': 'PM'}
+        
+        end_hour_var = tk.StringVar(value=end_parts['hour'])
+        end_hour_combo = ttk.Combobox(end_time_frm, textvariable=end_hour_var, values=self._get_hour_options(), width=2, state="readonly")
+        end_hour_combo.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(end_time_frm, text=":").pack(side=tk.LEFT, padx=2)
+        
+        end_minute_var = tk.StringVar(value=end_parts['minute'])
+        end_minute_combo = ttk.Combobox(end_time_frm, textvariable=end_minute_var, values=self._get_minute_options(), width=2, state="readonly")
+        end_minute_combo.pack(side=tk.LEFT, padx=2)
+        
+        end_period_var = tk.StringVar(value=end_parts['period'])
+        end_period_combo = ttk.Combobox(end_time_frm, textvariable=end_period_var, values=['AM', 'PM'], width=2, state="readonly")
+        end_period_combo.pack(side=tk.LEFT, padx=(2, 20))
+        
+        # Remove button
+        def on_remove():
+            if index < len(self.automation_manager.get_automations()):
+                self.automation_manager.remove_automation(index)
+                self._refresh_automations_display()
+        
+        remove_btn = ttk.Button(end_time_frm, text="Remove", command=on_remove)
+        remove_btn.pack(side=tk.LEFT)
+        
+        # Store entry data
+        entry_data = {
+            'frame': entry_frm,
+            'name_var': name_var,
+            'day_vars': day_vars,
+            'start_hour_var': start_hour_var,
+            'start_minute_var': start_minute_var,
+            'start_period_var': start_period_var,
+            'end_hour_var': end_hour_var,
+            'end_minute_var': end_minute_var,
+            'end_period_var': end_period_var,
+            'index': index
+        }
+        self.automation_entries.append(entry_data)
+
+    def _get_hour_options(self) -> list[str]:
+        """Generate hour options (1-12)."""
+        return [f"{i}" for i in range(1, 13)]
+    
+    def _get_minute_options(self) -> list[str]:
+        """Generate minute options in 5-minute intervals."""
+        return [f"{i:02d}" for i in range(0, 60, 5)]
+    
+    def _parse_time_string(self, time_str: str) -> dict:
+        """Parse time string like '9:30 AM' into components."""
+        try:
+            parts = time_str.split()
+            period = parts[-1] if parts[-1] in ('AM', 'PM') else 'PM'
+            time_part = parts[0]
+            hour, minute = time_part.split(':')
+            return {'hour': hour, 'minute': minute, 'period': period}
+        except Exception:
+            return {'hour': '12', 'minute': '00', 'period': 'PM'}
+    
+    def _time_from_components(self, hour: str, minute: str, period: str) -> str:
+        """Convert time components back to string format."""
+        return f"{hour}:{minute} {period}"
+
+    def _on_add_automation(self):
+        """Add a new blank automation entry."""
+        new_automation = ShowAutomation("New Show", [], "12:00 PM", "1:00 PM")
+        self.automation_manager.add_automation(new_automation)
+        self._refresh_automations_display()
+
+    def _on_apply_automations(self):
+        """Apply the automations from the UI."""
+        try:
+            # Collect automation data from UI
+            new_automations = []
+            for entry in self.automation_entries:
+                name = entry['name_var'].get().strip()
+                if not name:
+                    try:
+                        messagebox.showwarning("Automations", "All shows must have a name")
+                    except Exception:
+                        pass
+                    return
+                
+                # Collect selected days
+                days = [day for day, var in entry['day_vars'].items() if var.get()]
+                if not days:
+                    try:
+                        messagebox.showwarning("Automations", f"'{name}' must have at least one day selected")
+                    except Exception:
+                        pass
+                    return
+                
+                # Build time strings from components
+                start_time = self._time_from_components(
+                    entry['start_hour_var'].get(),
+                    entry['start_minute_var'].get(),
+                    entry['start_period_var'].get()
+                )
+                end_time = self._time_from_components(
+                    entry['end_hour_var'].get(),
+                    entry['end_minute_var'].get(),
+                    entry['end_period_var'].get()
+                )
+                
+                new_automations.append(ShowAutomation(name, days, start_time, end_time))
+            
+            # Replace automations
+            self.automation_manager.set_automations(new_automations)
+            
+            try:
+                messagebox.showinfo("Automations", f"Applied {len(new_automations)} show(s)")
+            except Exception:
+                pass
+            # If we've just applied automations, ensure the scheduler is running
+            # (respect license gating). Stop any existing scheduler first to
+            # reset internal state, then start if allowed and automations exist.
+            try:
+                try:
+                    import license_manager
+                    is_commercial = (license_manager.license_type() == 'commercial')
+                except Exception:
+                    is_commercial = False
+
+                try:
+                    # Stop existing scheduler to avoid duplicate threads
+                    self.automation_manager.stop_scheduler()
+                except Exception:
+                    pass
+
+                if is_commercial and self.automation_manager.get_automations():
+                    try:
+                        self.automation_manager.start_scheduler()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                messagebox.showerror("Automations", f"Error applying automations: {e}")
+            except Exception:
+                pass
+
+    def _on_automation_start(self):
+        """Callback when an automation triggers start."""
+        try:
+            # Schedule `start_capture` on the Tk main thread so UI operations
+            # are performed safely. Automation callbacks run in a background
+            # scheduler thread and must not touch Tk widgets directly.
+            def _do_start():
+                try:
+                    # Give immediate visual feedback that the automation
+                    # is starting the capture/engine. This helps when model
+                    # load takes time so user sees activity.
+                    try:
+                        self.model_status_var.set("Model: starting (automation)...")
+                    except Exception:
+                        pass
+                    # Do not disable the Start button before invoking it; some
+                    # ttk implementations prevent `invoke()` from calling the
+                    # command when the widget state is disabled. Rely on the
+                    # engine start success handler (`_on_started`) to update
+                    # button states so the UI wiring behaves the same as a
+                    # manual click.
+                    try:
+                        self._log_button_states("_on_automation_start - before invoke/start")
+                    except Exception:
+                        pass
+                    # Mark that this start was automation-initiated so
+                    # `start_capture` can skip the demo prompt and then
+                    # simulate pressing the visible Start button so any
+                    # associated UI wiring runs exactly as a manual click.
+                    try:
+                        self._suppress_demo_prompt = True
+                    except Exception:
+                        pass
+                    # For automation-initiated starts, call the start routine
+                    # directly rather than relying on `invoke()` which may be
+                    # ignored if the button widget is disabled. `start_capture`
+                    # already handles thread-safety and will update the UI on
+                    # success via its `_on_started` handler.
+                    try:
+                        if not getattr(self, 'engine', None) or not getattr(self.engine, 'running', False):
+                            try:
+                                self.start_capture()
+                                try:
+                                    self._log_button_states("_on_automation_start - direct start_capture called")
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                try:
+                                    print(f"[UI] _on_automation_start: direct start_capture raised: {e}")
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            # clear the flag so manual starts still prompt
+                            self._suppress_demo_prompt = False
+                        except Exception:
+                            pass
+                    try:
+                        self._log_button_states("_on_automation_start - after invoke/fallback and suppress cleared")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"Error in scheduled automation start: {e}")
+
+            try:
+                self.safe_after(0, _do_start)
+            except Exception:
+                # Fallback: call directly if scheduling fails
+                _do_start()
+        except Exception as e:
+            print(f"Error starting automation: {e}")
+
+    def _on_automation_stop(self):
+        """Callback when an automation triggers stop."""
+        try:
+            # Schedule `stop_capture` on the Tk main thread to avoid
+            # manipulating Tk widgets from the scheduler thread.
+            def _do_stop():
+                try:
+                    # Prefer invoking the Stop button so any UI wiring runs
+                    # the same as a manual click. Fall back to direct call.
+                    try:
+                        print("[UI] _do_stop: entered (automation stop handler)")
+                    except Exception:
+                        pass
+
+                    if hasattr(self, 'stop_btn') and getattr(self.stop_btn, 'invoke', None):
+                        try:
+                            try:
+                                state = self.stop_btn['state']
+                            except Exception:
+                                state = 'unknown'
+                            try:
+                                print(f"[UI] _do_stop: about to invoke stop_btn (state={state})")
+                            except Exception:
+                                pass
+                            try:
+                                self.stop_btn.invoke()
+                            except Exception as e:
+                                try:
+                                    print(f"[UI] _do_stop: stop_btn.invoke raised: {e}")
+                                except Exception:
+                                    pass
+                                if self.engine and getattr(self.engine, 'running', False):
+                                    self.stop_capture()
+                        except Exception:
+                            # Best-effort fallback
+                            if self.engine and getattr(self.engine, 'running', False):
+                                self.stop_capture()
+                    else:
+                        if self.engine and getattr(self.engine, 'running', False):
+                            self.stop_capture()
+
+                    # Auto-save transcript if enabled
+                    try:
+                        if self.auto_save_txt_var.get():
+                            self._auto_save_transcript()
+                    except Exception as e:
+                        print(f"Error in auto-save: {e}")
+
+                    # Update model status to reflect stopped state so user has
+                    # a clear visual indication the engine is not running.
+                    try:
+                        cur = None
+                        try:
+                            cur = self.model_status_var.get()
+                        except Exception:
+                            cur = None
+                        if cur:
+                            if '(stopped)' not in cur:
+                                self.model_status_var.set(f"{cur} (stopped)")
+                        else:
+                            self.model_status_var.set("Model: (stopped)")
+                    except Exception:
+                        pass
+
+                    # Ensure UI controls are restored regardless of engine state
+                    try:
+                        self.start_btn.config(state=tk.NORMAL)
+                        self.stop_btn.config(state=tk.DISABLED)
+                        try:
+                            self.device_combo.config(state="readonly")
+                        except Exception:
+                            try:
+                                self.device_combo.config(state=tk.NORMAL)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    try:
+                        self._log_button_states("_on_automation_stop restored UI")
+                    except Exception:
+                        pass
+
+                    # schedule a short check after invoking the stop button to
+                    # verify the UI updated; if not, force stop_capture().
+                    try:
+                        def _check_stop_effect():
+                            try:
+                                s = self.start_btn['state'] if getattr(self, 'start_btn', None) is not None else 'unknown'
+                            except Exception:
+                                s = 'unknown'
+                            try:
+                                t = self.stop_btn['state'] if getattr(self, 'stop_btn', None) is not None else 'unknown'
+                            except Exception:
+                                t = 'unknown'
+                            try:
+                                print(f"[UI] _do_stop: post-invoke check start={s} stop={t}")
+                            except Exception:
+                                pass
+                            try:
+                                # Diagnose exact values
+                                try:
+                                    print(f"[UI] _do_stop: post-invoke values repr(s)={repr(s)} type(s)={type(s)} repr(t)={repr(t)} type(t)={type(t)}")
+                                except Exception:
+                                    pass
+                                try:
+                                    has_instate = getattr(self.stop_btn, 'instate', None) is not None and getattr(self.start_btn, 'instate', None) is not None
+                                except Exception:
+                                    has_instate = False
+                                try:
+                                    if has_instate:
+                                        start_ok = not self.start_btn.instate(['disabled'])
+                                        stop_ok = self.stop_btn.instate(['disabled'])
+                                    else:
+                                        start_ok = ('normal' in str(s))
+                                        stop_ok = ('disabled' in str(t))
+                                except Exception:
+                                    start_ok = False
+                                    stop_ok = False
+                                try:
+                                    print(f"[UI] _do_stop: interpreted start_ok={start_ok} stop_ok={stop_ok} engine_running={getattr(self.engine, 'running', False) if getattr(self, 'engine', None) is not None else False}")
+                                except Exception:
+                                    pass
+                                if (not start_ok) or (not stop_ok):
+                                    try:
+                                        print("[UI] _do_stop: post-invoke check forcing stop_capture()")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self.stop_capture()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        try:
+                            self.safe_after(200, _check_stop_effect)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    # Final safety restore: after a short delay, force UI controls
+                    # back to a sane state. This defends against races where the
+                    # stop command ran but UI state was not updated due to a timing
+                    # issue in some Tk/Ttk environments.
+                    try:
+                        def _final_restore():
+                            try:
+                                self.start_btn.config(state=tk.NORMAL)
+                                self.stop_btn.config(state=tk.DISABLED)
+                                try:
+                                    self.device_combo.config(state="readonly")
+                                except Exception:
+                                    try:
+                                        self.device_combo.config(state=tk.NORMAL)
+                                    except Exception:
+                                        pass
+                                try:
+                                    self._log_button_states("_on_automation_stop - final_restore")
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        try:
+                            self.safe_after(300, _final_restore)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    print(f"Error in scheduled automation stop: {e}")
+
+            try:
+                self.safe_after(0, _do_stop)
+            except Exception:
+                _do_stop()
+        except Exception as e:
+            print(f"Error stopping automation: {e}")
+    
+    def _auto_save_transcript(self):
+        """Auto-save transcript to default location and clear main tab."""
+        try:
+            # Get transcript text
+            transcript_text = self.transcript.get("1.0", tk.END).strip()
+            if not transcript_text:
+                return
+            
+            # Create default directory if needed
+            os.makedirs(self.auto_save_txt_path, exist_ok=True)
+            
+            # Generate filename with timestamp and optionally include show name
+            from datetime import datetime
+            import re
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Try to get the active show's name from the automation manager (if present)
+            show_name = None
+            try:
+                mgr = getattr(self, 'automation_manager', None)
+                active = getattr(mgr, '_active_automation', None) if mgr else None
+                if active and getattr(active, 'name', None):
+                    show_name = str(active.name).strip()
+            except Exception:
+                show_name = None
+
+            if show_name:
+                # Sanitize show name for a safe filename: remove invalid filesystem chars and replace spaces with underscores
+                safe = re.sub(r'[<>:"/\\|?*]', '', show_name)
+                safe = safe.strip().replace(' ', '_') or 'transcript'
+                base_name = safe
+            else:
+                base_name = 'transcript'
+
+            filename = os.path.join(self.auto_save_txt_path, f"{base_name}_{timestamp}.txt")
+            
+            # Save transcript
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(transcript_text)
+            
+            # Clear transcript in main tab
+            self.transcript.delete("1.0", tk.END)
+            
+            print(f"Auto-saved transcript to: {filename}")
+        except Exception as e:
+            print(f"Error auto-saving transcript: {e}")
 
     def _refresh_vocab_list(self):
         self.vocab_listbox.delete(0, tk.END)
@@ -3562,9 +4736,9 @@ class App(tk.Tk):
             try:
                 meta = self.profile_mgr.create_profile(name, wavs)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", f"Could not create profile: {e}"))
+                self.safe_after(0, lambda: messagebox.showerror("Error", f"Could not create profile: {e}"))
                 return
-            self.after(0, lambda: self._on_profile_created(meta))
+            self.safe_after(0, lambda: self._on_profile_created(meta))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3610,12 +4784,12 @@ class App(tk.Tk):
             try:
                 ok = self.profile_mgr.delete_profile(name)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Delete Profile", f"Failed to delete profile: {e}"))
+                self.safe_after(0, lambda: messagebox.showerror("Delete Profile", f"Failed to delete profile: {e}"))
                 return
             if ok:
-                self.after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Deleted: {name}")])
+                self.safe_after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Deleted: {name}")])
             else:
-                self.after(0, lambda: messagebox.showwarning("Delete Profile", "Profile not found"))
+                self.safe_after(0, lambda: messagebox.showwarning("Delete Profile", "Profile not found"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3651,9 +4825,9 @@ class App(tk.Tk):
                 else:
                     res = self.profile_mgr.edit_profile(name, add_wav_paths=list(paths))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Add/Change WAVs", f"Failed to update profile: {e}"))
+                self.safe_after(0, lambda: messagebox.showerror("Add/Change WAVs", f"Failed to update profile: {e}"))
                 return
-            self.after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Updated: {res.get('name')}")])
+            self.safe_after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Updated: {res.get('name')}")])
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3765,10 +4939,10 @@ class App(tk.Tk):
                                                          remove_wav_filenames=(removed if removed else None),
                                                          replace_wav_paths=(replace_paths if replace_paths else None))
                 except Exception as e:
-                    self.after(0, lambda: messagebox.showerror("Edit Profile", f"Failed to save profile: {e}"))
+                    self.safe_after(0, lambda: messagebox.showerror("Edit Profile", f"Failed to save profile: {e}"))
                     return
                 # refresh UI
-                self.after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Updated: {res.get('name')}")])
+                self.safe_after(0, lambda: [self._refresh_profiles_list(), self.profile_status.config(text=f"Updated: {res.get('name')}")])
                 try:
                     dlg.destroy()
                 except Exception:
@@ -3792,5 +4966,11 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Start VAICCS GUI")
+    parser.add_argument('--simulate-automation', action='store_true', help='Simulate an automation start/stop for demo purposes')
+    args = parser.parse_args()
+
+    app = App(simulate_automation=args.simulate_automation)
     app.mainloop()

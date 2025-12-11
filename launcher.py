@@ -183,6 +183,13 @@ def check():
                         LONG_INTERVAL = 24 * 3600
                         while True:
                             try:
+                                # Check if app is still running (window is still valid)
+                                try:
+                                    if not app_ref.winfo_exists():
+                                        return
+                                except Exception:
+                                    return
+                                
                                 # load saved license and product key
                                 try:
                                     data = license_manager.load_license()
@@ -267,6 +274,11 @@ def check():
                 except Exception:
                     pass
                 app.mainloop()
+                # App closed, now destroy the root window so launcher.py can exit
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
             except Exception as e:
                 # If launching the GUI failed, fall back to printing error
                 print("Failed to start GUI:", e)

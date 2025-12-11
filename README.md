@@ -1,4 +1,4 @@
-# Closed Captioning — GUI Usage
+# VAICCS (the Vosk Artificial Intelligence Closed Captioning Software)
 
 This repository provides a live closed-captioning application that can run from a graphical interface (`VAICCS.exe`) 
 
