@@ -11,6 +11,11 @@ import tarfile
 import shutil
 import tempfile
 import sys
+import webbrowser
+import subprocess
+import datetime
+import re
+from urllib.parse import quote, urlparse
 from main import CaptionEngine
 import main as mainmod
 from voice_profiles import VoiceProfileManager
@@ -62,7 +67,7 @@ class App(tk.Tk):
 
         # Set up the main window (kept hidden until splash is closed)
         self.title("VAICCS (Beta)")
-        self.geometry("900x900")
+        self.geometry("900x800")
 
         # Replace the default Tk icon (feather) with bundled `icon.ico` if available
         try:
@@ -138,7 +143,7 @@ class App(tk.Tk):
             self._bad_words_menu_index = file_menu.index("end")
         except Exception:
             self._bad_words_menu_index = None
-        file_menu.add_command(label="Open Settings...", accelerator="Ctrl+O", command=lambda: self._on_open_settings())
+        file_menu.add_command(label="Load Settings...", accelerator="Ctrl+O", command=lambda: self._on_open_settings())
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Alt-F4", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -176,7 +181,9 @@ class App(tk.Tk):
         help_menu = tk.Menu(menubar, tearoff=0)
         # Activate dialog (personal free / commercial paid). Placeholder UI.
         help_menu.add_command(label="Activate", command=lambda: self._open_activate())
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nBeta Build"))
+        help_menu.add_command(label="Check for Updates...", command=lambda: self._check_for_updates(manual=True))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About",
+                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         try:
@@ -204,6 +211,28 @@ class App(tk.Tk):
                 self._splash.update_status("Creating UI tabs...")
         except Exception:
             pass
+
+        # Load GUI settings (including update prefs) and possibly auto-check
+        try:
+            self._gui_settings = self._load_gui_settings()
+        except Exception:
+            self._gui_settings = {}
+
+        try:
+            # Create a BooleanVar for the auto-update preference (Options dialog will expose it)
+            ups = (self._gui_settings or {}).get('updates', {})
+            auto = bool(ups.get('auto_check', False))
+            try:
+                self.auto_check_updates_var = tk.BooleanVar(value=auto)
+            except Exception:
+                self.auto_check_updates_var = tk.BooleanVar()
+                try:
+                    self.auto_check_updates_var.set(auto)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -764,13 +793,49 @@ class App(tk.Tk):
 
         try:
             self.serial_manager = SerialManager(port, baud)
-            self.serial_manager.open()
+            opened = False
+            try:
+                opened = bool(self.serial_manager.open())
+            except Exception:
+                opened = False
+
+            if not opened:
+                try:
+                    self.serial_manager.close()
+                except Exception:
+                    pass
+                self.serial_manager = None
+                # show detailed error if available
+                err = getattr(self.serial_manager, 'last_error', None)
+                if not err:
+                    err = f"failed to open {port}@{baud}"
+                try:
+                    self.serial_status_var.set(f"Serial error: {err}")
+                except Exception:
+                    pass
+                try:
+                    messagebox.showerror("Serial", f"Failed to open serial port: {err}")
+                except Exception:
+                    pass
+                self.serial_enabled_var.set(False)
+                return
+
             self.serial_status_var.set(f"Serial: connected {port}@{baud}")
         except Exception as e:
-            self.serial_manager = None
-            self.serial_status_var.set(f"Serial error: {e}")
-            messagebox.showerror("Serial", f"Failed to open serial port: {e}")
+            try:
+                self.serial_manager = None
+            except Exception:
+                pass
+            try:
+                self.serial_status_var.set(f"Serial error: {e}")
+            except Exception:
+                pass
+            try:
+                messagebox.showerror("Serial", f"Failed to open serial port: {e}")
+            except Exception:
+                pass
             self.serial_enabled_var.set(False)
+            return
         # no automatic persistence
 
     #send a test line over serial button
@@ -779,8 +844,19 @@ class App(tk.Tk):
             if not self.serial_manager:
                 messagebox.showwarning("Serial", "Not connected")
                 return
-            self.serial_manager.send_line("TEST: Hello from Caption GUI")
-            messagebox.showinfo("Serial", "Test sent")
+            ok = False
+            try:
+                ok = bool(self.serial_manager.send_line("TEST: Hello from Caption GUI"))
+            except Exception:
+                ok = False
+
+            if ok:
+                messagebox.showinfo("Serial", "Test sent")
+            else:
+                try:
+                    messagebox.showerror("Serial", "Serial send failed (port closed or write error)")
+                except Exception:
+                    pass
         except Exception as e:
             messagebox.showerror("Serial", f"Serial send failed: {e}")
 
@@ -973,6 +1049,637 @@ class App(tk.Tk):
         # this method will be called with a path by _on_open_settings; if no
         # path is provided, do nothing.
         pass
+
+    def _load_gui_settings(self):
+        try:
+            here = os.path.dirname(__file__)
+            local_path = os.path.join(here, 'gui_settings.json')
+            if os.path.exists(local_path):
+                with open(local_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_gui_settings(self):
+        try:
+            here = os.path.dirname(__file__)
+            local_path = os.path.join(here, 'gui_settings.json')
+            with open(local_path, 'w', encoding='utf-8') as lf:
+                json.dump(self._gui_settings or {}, lf, indent=2)
+        except Exception:
+            pass
+
+    def _on_toggle_auto_check_updates(self):
+        """Persist the user's preference for automatic update checks."""
+        try:
+            s = self._gui_settings or {}
+            ups = s.get('updates')
+            if ups is None:
+                ups = {}
+                s['updates'] = ups
+            ups['auto_check'] = bool(getattr(self, 'auto_check_updates_var', tk.BooleanVar(value=False)).get())
+            self._gui_settings = s
+            self._save_gui_settings()
+        except Exception:
+            pass
+
+    def _maybe_auto_check_updates(self):
+        try:
+            s = self._gui_settings or {}
+            ups = s.get('updates', {})
+            auto = bool(ups.get('auto_check', False))
+            if not auto:
+                return
+            last = ups.get('last_checked')
+            if last:
+                try:
+                    last_dt = datetime.datetime.fromisoformat(last)
+                except Exception:
+                    last_dt = None
+            else:
+                last_dt = None
+            now = datetime.datetime.now(datetime.timezone.utc)
+            do_check = False
+            if last_dt is None:
+                do_check = True
+            else:
+                try:
+                    delta = now - last_dt
+                    if delta.total_seconds() > 24 * 3600:
+                        do_check = True
+                except Exception:
+                    do_check = True
+
+            if do_check:
+                # run check in background
+                self._check_for_updates(manual=False)
+        except Exception:
+            pass
+
+    def _check_for_updates(self, manual: bool = True):
+        # Kick off a background thread to query GitHub Releases
+        try:
+            t = threading.Thread(target=self._check_for_updates_thread, args=(manual,), daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def _check_for_updates_thread(self, manual: bool = False):
+        try:
+            repo_api = 'https://api.github.com/repos/dominicskywalkr/VAICCS/releases/latest'
+            headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'VAICCS-Updater/1.0'}
+            try:
+                resp = requests.get(repo_api, headers=headers, timeout=10)
+            except Exception:
+                # network error
+                if manual:
+                    try:
+                        messagebox.showinfo('Updates', 'Failed to check for updates (network error).')
+                    except Exception:
+                        pass
+                return
+
+            if resp.status_code != 200:
+                # Attempt a web-fallback: fetch the releases page HTML and find the first
+                # occurrence of "/releases/tag/<tag>" which usually points to the latest release.
+                try:
+                    releases_page = 'https://github.com/dominicskywalkr/VAICCS/releases'
+                    r3 = requests.get(releases_page, timeout=10)
+                    tag = ''
+                    if r3.status_code == 200 and r3.text:
+                        try:
+                            # look for links to releases with tag in href
+                            m = re.search(r'/releases?/tag/([^"\'\s>]+)', r3.text)
+                            if m:
+                                tag = m.group(1)
+                        except Exception:
+                            tag = ''
+
+                    if tag:
+                        latest_ver = re.sub(r'^v', '', tag, flags=re.IGNORECASE)
+                        data = {'name': tag, 'body': ''}
+                    else:
+                        if manual:
+                            reason = f'HTTP {resp.status_code}'
+                            try:
+                                rl = resp.headers.get('X-RateLimit-Remaining')
+                                if rl is not None:
+                                    reason += f' (rate limit remaining: {rl})'
+                            except Exception:
+                                pass
+                            try:
+                                messagebox.showinfo('Updates', f'Failed to determine latest release from GitHub (API {reason}).\nOpening releases page in your browser.')
+                            except Exception:
+                                pass
+                            try:
+                                webbrowser.open(releases_page)
+                            except Exception:
+                                pass
+                        return
+                except Exception:
+                    if manual:
+                        try:
+                            messagebox.showinfo('Updates', 'Failed to check for updates (web fallback error).')
+                        except Exception:
+                            pass
+                    return
+            else:
+                data = resp.json()
+            # Prefer the release "name" (e.g. "VAICCS 1.0 beta-1"); fall back to tag_name
+            release_name = str(data.get('name') or data.get('tag_name') or '')
+            # If the release name starts with the product name, strip it ("VAICCS 1.0 beta-1" -> "1.0 beta-1")
+            m = re.match(r'^(?:VAICCS\s*)?(.*)$', release_name, flags=re.IGNORECASE)
+            latest_ver = m.group(1).strip() if m else release_name
+            # normalize leading v if present
+            latest_ver = re.sub(r'^v', '', latest_ver, flags=re.IGNORECASE)
+            changelog = data.get('body', '') or ''
+            html_url = data.get('html_url') or f'https://github.com/dominicskywalkr/VAICCS/releases'
+            assets = data.get('assets', []) or []
+            asset_url = None
+            asset_name = None
+            # Look specifically for the known installer filename first
+            desired_asset = 'VAICCS.install.AMD64.exe'
+            for a in assets:
+                name = a.get('name', '') or ''
+                if name == desired_asset:
+                    asset_url = a.get('browser_download_url')
+                    asset_name = name
+                    break
+            # fallback: pick first common installer-like asset
+            if not asset_url:
+                for a in assets:
+                    name = a.get('name', '') or ''
+                    if name.lower().endswith(('.exe', '.msi', '.zip')):
+                        asset_url = a.get('browser_download_url')
+                        asset_name = name
+                        break
+
+            # If no assets were provided (e.g., API rate-limited or initial call failed),
+            # try the releases-by-tag API if we can determine a tag. Also attempt
+            # to construct a direct download URL for the known installer filename
+            # (GitHub releases download URL pattern) and verify it with HEAD.
+            try:
+                if not assets:
+                    tag = data.get('tag_name') or ''
+                    if not tag:
+                        # try to extract from html_url
+                        try:
+                            from urllib.parse import unquote, urlparse
+                            p = urlparse(html_url).path
+                            p = unquote(p or '')
+                            mtag = re.search(r'/releases?/tag/([^/]+)', p)
+                            if mtag:
+                                tag = mtag.group(1)
+                            else:
+                                seg = p.rstrip('/').split('/')[-1] if p else ''
+                                if re.search(r'\d', seg):
+                                    tag = seg
+                        except Exception:
+                            tag = ''
+
+                    if tag:
+                        tag_api = f'https://api.github.com/repos/dominicskywalkr/VAICCS/releases/tags/{tag}'
+                        try:
+                            rtag = requests.get(tag_api, headers=headers, timeout=10)
+                            if rtag.status_code == 200:
+                                tdata = rtag.json()
+                                tassets = tdata.get('assets', []) or []
+                                if tassets:
+                                    assets = tassets
+                                    data = tdata
+                                    # re-run asset selection for updated assets
+                                    for a in assets:
+                                        name = a.get('name', '') or ''
+                                        if name == desired_asset:
+                                            asset_url = a.get('browser_download_url')
+                                            asset_name = name
+                                            break
+                                    if not asset_url:
+                                        for a in assets:
+                                            name = a.get('name', '') or ''
+                                            if name.lower().endswith(('.exe', '.msi', '.zip')):
+                                                asset_url = a.get('browser_download_url')
+                                                asset_name = name
+                                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # If still no asset_url, try constructing a direct download URL using
+            # likely tag candidates and check with a HEAD request.
+            try:
+                if not asset_url:
+                    tag_candidates = []
+                    # prefer explicit tag_name from API if present
+                    tname = data.get('tag_name') or ''
+                    if tname:
+                        tag_candidates.append(tname)
+                    # also try release_name (raw) and latest_ver (normalized)
+                    if release_name:
+                        tag_candidates.append(release_name)
+                    if latest_ver:
+                        tag_candidates.append(latest_ver)
+
+                    # normalize and try variants (with/without leading v)
+                    tried = set()
+                    for t in tag_candidates:
+                        if not t:
+                            continue
+                        for candidate in (t, f'v{t}' if not str(t).lower().startswith('v') else t):
+                            if candidate in tried:
+                                continue
+                            tried.add(candidate)
+                            try:
+                                safe_tag = quote(str(candidate), safe='')
+                                test_url = f'https://github.com/dominicskywalkr/VAICCS/releases/download/{safe_tag}/{desired_asset}'
+                                h = requests.head(test_url, allow_redirects=True, timeout=10, headers=headers)
+                                if h.status_code == 200:
+                                    asset_url = test_url
+                                    asset_name = desired_asset
+                                    break
+                            except Exception:
+                                pass
+                        if asset_url:
+                            break
+            except Exception:
+                pass
+
+            current = getattr(mainmod, '__version__', '0.0.0')
+
+            # For manual checks, prepare debug info to help diagnose mismatch
+            try:
+                ln_norm = _normalize_for_parse(latest_ver)
+            except Exception:
+                ln_norm = latest_ver
+            try:
+                cn_norm = _normalize_for_parse(current)
+            except Exception:
+                cn_norm = current
+
+            def _normalize_for_parse(s: str) -> str:
+                if not s:
+                    return s
+                s = s.strip()
+                # remove leading product name if present and leading v
+                s = re.sub(r'^(?:vaiccs\s*)', '', s, flags=re.IGNORECASE)
+                s = re.sub(r'^v', '', s, flags=re.IGNORECASE)
+                # Normalize common pre-release words to PEP 440 short forms
+                s = re.sub(r'(?i)\balpha[-\s]?(\d+)\b', r'a\1', s)
+                s = re.sub(r'(?i)\bbeta[-\s]?(\d+)\b', r'b\1', s)
+                s = re.sub(r'(?i)\brc[-\s]?(\d+)\b', r'rc\1', s)
+                # Replace stray spaces and hyphens between numeric and pre-release
+                s = re.sub(r'\s*[-\s]\s*', '', s)
+                return s
+
+            def _is_newer(latest, current):
+                try:
+                    from packaging import version as _pv
+                    ln = _normalize_for_parse(str(latest))
+                    cn = _normalize_for_parse(str(current))
+                    return _pv.parse(ln) > _pv.parse(cn)
+                except Exception:
+                    # fallback: semver-like compare with pre-release handling
+                    def _parse_simple(s: str):
+                        s = str(s or '')
+                        s = s.strip()
+                        # split main numeric and prerelease parts
+                        m = re.match(r"^([0-9]+(?:\.[0-9]+)*)(?:[-_\s]?([ab]|rc|alpha|beta|pre|c|b|a)[-_.]?(\d+)?)?$", s, flags=re.IGNORECASE)
+                        if not m:
+                            # try to extract numbers only
+                            nums = tuple(int(x) for x in re.findall(r'\d+', s))
+                            return (nums, None, 0)
+                        nums = tuple(int(x) for x in m.group(1).split('.'))
+                        pr_type = m.group(2)
+                        pr_num = m.group(3)
+                        if pr_type:
+                            pr_type = pr_type.lower()
+                            # normalize common aliases
+                            if pr_type in ('a', 'alpha'):
+                                pr_type = 'a'
+                            elif pr_type in ('b', 'beta'):
+                                pr_type = 'b'
+                            elif pr_type in ('c', 'rc'):
+                                pr_type = 'rc'
+                        if pr_num:
+                            try:
+                                pr_num = int(pr_num)
+                            except Exception:
+                                pr_num = 0
+                        else:
+                            pr_num = 0
+                        return (nums, pr_type, pr_num)
+
+                    def _cmp(a, b):
+                        # compare numeric tuples
+                        an, atype, anum = _parse_simple(a)
+                        bn, btype, bnum = _parse_simple(b)
+                        if an != bn:
+                            # pad shorter with zeros
+                            la = list(an)
+                            lb = list(bn)
+                            L = max(len(la), len(lb))
+                            la += [0] * (L - len(la))
+                            lb += [0] * (L - len(lb))
+                            if tuple(la) != tuple(lb):
+                                return 1 if tuple(la) > tuple(lb) else -1
+                        # numeric equal; handle prerelease: None means final release (greater)
+                        order = {None: 3, 'rc': 2, 'b': 1, 'a': 0}
+                        ao = order.get(atype, -1)
+                        bo = order.get(btype, -1)
+                        if ao != bo:
+                            return 1 if ao > bo else -1
+                        # same prerelease type: compare numbers
+                        if anum != bnum:
+                            return 1 if anum > bnum else -1
+                        return 0
+
+                    return _cmp(latest, current) == 1
+
+            newer = False
+            try:
+                newer = _is_newer(latest_ver, current)
+            except Exception:
+                newer = False
+
+            # Debug info removed for production. Manual checks will show the
+            # updates dialog (or a simple "you're up to date" message).
+
+            # update last_checked
+            try:
+                s = self._gui_settings or {}
+                ups = s.setdefault('updates', {})
+                ups['last_checked'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self._gui_settings = s
+                self._save_gui_settings()
+            except Exception:
+                pass
+
+            # check ignore list
+            try:
+                s = self._gui_settings or {}
+                ignore = set(s.get('updates', {}).get('ignore_versions', []) or [])
+                if latest_ver in ignore:
+                    return
+            except Exception:
+                pass
+
+            if newer:
+                # show dialog on main thread
+                try:
+                    # pass asset_url separately so dialog can decide whether a direct
+                    # download is available. If not, Download will open the releases page.
+                    self.after(0, lambda: self._show_update_dialog(current, latest_ver, changelog, asset_url, html_url, asset_name))
+                except Exception:
+                    pass
+            else:
+                if manual:
+                    try:
+                        messagebox.showinfo('Updates', f'You are running the latest version ({current}).')
+                    except Exception:
+                        pass
+        except Exception:
+            if manual:
+                try:
+                    messagebox.showinfo('Updates', 'Failed to check for updates.')
+                except Exception:
+                    pass
+
+    def _show_update_dialog(self, current, latest, changelog, asset_url, releases_page, asset_name=None):
+        try:
+            w = tk.Toplevel(self)
+            # Make dialog transient/modal above the main window
+            try:
+                w.transient(self)
+                w.grab_set()
+                w.lift()
+                w.focus_force()
+                # briefly force topmost so it appears above other windows
+                try:
+                    w.attributes('-topmost', True)
+                    self.after(100, lambda: w.attributes('-topmost', False))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            w.title('Updates')
+            w.geometry('600x400')
+            ttk.Label(w, text=f'Current version: {current}').pack(anchor='w', padx=10, pady=4)
+            ttk.Label(w, text=f'Latest version: {latest}').pack(anchor='w', padx=10, pady=4)
+            txt = tk.Text(w, height=12, wrap='word')
+            txt.pack(fill='both', expand=True, padx=10, pady=4)
+            try:
+                txt.insert('1.0', changelog or '(no changelog provided)')
+            except Exception:
+                pass
+            txt.config(state='disabled')
+
+            btn_frame = ttk.Frame(w)
+            btn_frame.pack(fill='x', padx=10, pady=6)
+
+            def _open_releases():
+                try:
+                    webbrowser.open(releases_page)
+                except Exception:
+                    pass
+
+            def _download_and_run_cb():
+                # If an actual asset URL is provided, download it; otherwise open releases page
+                if asset_url:
+                    self._download_and_run(asset_url, asset_name)
+                else:
+                    try:
+                        webbrowser.open(releases_page)
+                    except Exception:
+                        pass
+
+            def _ignore_cb():
+                try:
+                    s = self._gui_settings or {}
+                    ups = s.setdefault('updates', {})
+                    lst = ups.setdefault('ignore_versions', [])
+                    if latest not in lst:
+                        lst.append(latest)
+                    self._gui_settings = s
+                    self._save_gui_settings()
+                except Exception:
+                    pass
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+
+            # If no direct installer asset is available, label button accordingly
+            download_label = 'Download' if asset_url else 'Open Releases Page'
+            ttk.Button(btn_frame, text=download_label, command=_download_and_run_cb).pack(side='left')
+            if asset_url:
+                ttk.Button(btn_frame, text='Open Releases Page', command=_open_releases).pack(side='left', padx=6)
+            ttk.Button(btn_frame, text='Ignore this version', command=_ignore_cb).pack(side='right')
+            ttk.Button(btn_frame, text='Remind Me Later', command=lambda: w.destroy()).pack(side='right', padx=6)
+        except Exception:
+            pass
+
+    def _download_and_run(self, url, suggested_name=None):
+        # Show a progress dialog and perform the download in a background thread
+        try:
+            if not url:
+                try:
+                    messagebox.showerror('Download', 'No downloadable asset available for this release.')
+                except Exception:
+                    pass
+                return
+
+            confirm = messagebox.askyesno('Download', f'Download installer from {url}?')
+            if not confirm:
+                return
+
+            # Prepare progress dialog
+            dlg = tk.Toplevel(self)
+            dlg.title('Downloading')
+            dlg.geometry('500x140')
+            ttk.Label(dlg, text='Downloading installer...').pack(anchor='w', padx=10, pady=(10, 2))
+            progress_var = tk.DoubleVar(value=0.0)
+            pb = ttk.Progressbar(dlg, variable=progress_var, maximum=100.0)
+            pb.pack(fill='x', padx=10, pady=6)
+            status_lbl = ttk.Label(dlg, text='Starting...')
+            status_lbl.pack(anchor='w', padx=10)
+
+            btn_frame = ttk.Frame(dlg)
+            btn_frame.pack(fill='x', padx=10, pady=8)
+            run_btn = ttk.Button(btn_frame, text='Run Installer', state='disabled')
+            run_btn.pack(side='right')
+            cancel_btn = ttk.Button(btn_frame, text='Cancel')
+            cancel_btn.pack(side='right', padx=6)
+
+            cancel_event = threading.Event()
+
+            def on_cancel():
+                cancel_event.set()
+                try:
+                    status_lbl.config(text='Cancelling...')
+                except Exception:
+                    pass
+
+            cancel_btn.config(command=on_cancel)
+
+            # determine extension to preserve
+            try:
+                if suggested_name:
+                    ext = os.path.splitext(suggested_name)[1] or ''
+                else:
+                    ext = os.path.splitext(urlparse(url).path)[1] or ''
+            except Exception:
+                ext = os.path.splitext(url)[1] if isinstance(url, str) else ''
+
+            def _dl_thread():
+                fd = None
+                tmp_path = None
+                try:
+                    with requests.get(url, stream=True, timeout=30) as r:
+                        if r.status_code != 200:
+                            self.after(0, lambda: messagebox.showerror('Download', f'Failed to download: HTTP {r.status_code}'))
+                            try:
+                                dlg.destroy()
+                            except Exception:
+                                pass
+                            return
+
+                        total = 0
+                        try:
+                            total = int(r.headers.get('Content-Length') or 0)
+                        except Exception:
+                            total = 0
+
+                        # create temp file
+                        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+                        downloaded = 0
+                        # choose determinate or indeterminate
+                        if total > 0:
+                            # set maximum to total bytes and update in bytes
+                            self.after(0, lambda: pb.config(mode='determinate'))
+                        else:
+                            self.after(0, lambda: (pb.config(mode='indeterminate'), pb.start(10)))
+
+                        with os.fdopen(fd, 'wb') as outf:
+                            for chunk in r.iter_content(8192):
+                                if cancel_event.is_set():
+                                    # abort
+                                    try:
+                                        outf.flush()
+                                    except Exception:
+                                        pass
+                                    break
+                                if chunk:
+                                    outf.write(chunk)
+                                    downloaded += len(chunk)
+                                    if total > 0:
+                                        percent = (downloaded / total) * 100.0
+                                        self.after(0, lambda p=percent: progress_var.set(p))
+                                        self.after(0, lambda d=downloaded: status_lbl.config(text=f'{d} / {total} bytes'))
+                        # if indeterminate, stop the animation
+                        if total <= 0:
+                            try:
+                                self.after(0, lambda: pb.stop())
+                            except Exception:
+                                pass
+
+                        if cancel_event.is_set():
+                            # remove partial file
+                            try:
+                                if tmp_path and os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            try:
+                                dlg.destroy()
+                            except Exception:
+                                pass
+                            return
+
+                        # finished successfully
+                        try:
+                            status_lbl.config(text=f'Download complete: {tmp_path}')
+                        except Exception:
+                            pass
+
+                        def _run_installer():
+                            try:
+                                if sys.platform.startswith('win'):
+                                    os.startfile(tmp_path)
+                                else:
+                                    subprocess.Popen(['chmod', '+x', tmp_path])
+                                    subprocess.Popen([tmp_path])
+                            except Exception:
+                                try:
+                                    messagebox.showinfo('Run Installer', f'Installer saved to: {tmp_path}')
+                                except Exception:
+                                    pass
+
+                        # enable run button
+                        try:
+                            self.after(0, lambda: run_btn.config(state='normal', command=_run_installer))
+                        except Exception:
+                            pass
+
+                except Exception:
+                    try:
+                        self.after(0, lambda: messagebox.showerror('Download', 'Download failed.'))
+                    except Exception:
+                        pass
+                    try:
+                        if fd:
+                            os.close(fd)
+                    except Exception:
+                        pass
+                finally:
+                    pass
+
+            th = threading.Thread(target=_dl_thread, daemon=True)
+            th.start()
+
+        except Exception:
+            pass
 
     def _save_settings(self):
         # Deprecated: persistence removed. Use Save Settings (Save As) menu to
@@ -1169,7 +1876,7 @@ class App(tk.Tk):
 
     def _on_open_settings(self):
         try:
-            path = filedialog.askopenfilename(title="Open Settings", filetypes=[("JSON files", "*.json"), ("All files", "*")])
+            path = filedialog.askopenfilename(title="Load Settings", filetypes=[("JSON files", "*.json"), ("All files", "*")])
             if not path:
                 return
             # load settings from chosen file (session only — no automatic persistence)
@@ -1178,7 +1885,7 @@ class App(tk.Tk):
                     data = json.load(f)
             except Exception as e:
                 try:
-                    messagebox.showerror("Open Settings", f"Failed to read settings: {e}")
+                    messagebox.showerror("Load Settings", f"Failed to read settings: {e}")
                 except Exception:
                     pass
                 return
@@ -1759,6 +2466,18 @@ class App(tk.Tk):
         separator = ttk.Separator(frm, orient='horizontal')
         separator.pack(fill=tk.X, pady=(12, 6))
 
+        # Update check preference
+        try:
+            upd_chk_frm = ttk.Frame(frm)
+            upd_chk_frm.pack(fill=tk.X, pady=(4, 6))
+            try:
+                ttk.Checkbutton(upd_chk_frm, text="Automatically check for updates",
+                               variable=getattr(self, 'auto_check_updates_var', tk.BooleanVar())).pack(anchor=tk.W)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         auto_save_lbl = ttk.Label(frm, text="Auto-Save Transcript Settings", font=('', 10, 'bold'))
         auto_save_lbl.pack(anchor=tk.W, pady=(4, 6))
 
@@ -1837,6 +2556,15 @@ class App(tk.Tk):
             try:
                 self.auto_save_txt_var.set(path_var.get() != '')  # checkbox tied to whether path is set
                 self.auto_save_txt_path = path_var.get()
+            except Exception:
+                pass
+            # Persist update-check preference
+            try:
+                try:
+                    # call the handler which saves the var into gui settings
+                    self._on_toggle_auto_check_updates()
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -3235,11 +3963,14 @@ class App(tk.Tk):
 
             # forward to serial if enabled
             try:
-                if getattr(self, 'serial_manager', None) and getattr(self, 'serial_enabled_var', None) and self.serial_enabled_var.get():
-                    try:
-                        self.serial_manager.send_line(text)
-                    except Exception as e:
-                        self.serial_status_var.set(f"Serial send error: {e}")
+                    sm = getattr(self, 'serial_manager', None)
+                    if sm and getattr(self, 'serial_enabled_var', None) and self.serial_enabled_var.get():
+                        try:
+                            ok = bool(sm.send_line(text))
+                            if not ok:
+                                self.serial_status_var.set("Serial send failed (port closed or write error)")
+                        except Exception as e:
+                            self.serial_status_var.set(f"Serial send error: {e}")
             except Exception:
                 pass
 

@@ -6,6 +6,8 @@ lines. Also exposes `list_serial_ports()` to enumerate available COM ports.
 This module avoids opening a port at import time so importing it is safe
 when pyserial is not available; callers should handle missing dependency.
 """
+import sys
+import time
 from typing import List, Optional
 
 try:
@@ -98,19 +100,36 @@ class SerialManager:
         self.baud = int(baud)
         self.timeout = float(timeout)
         self._ser = None
+        # human-readable error from last operation
+        self.last_error: Optional[str] = None
 
     def open(self) -> bool:
         """Open the configured serial port. Returns True on success."""
         if serial is None:
+            self.last_error = "pyserial is not installed"
             raise RuntimeError("pyserial is not installed")
         if not self.port:
+            self.last_error = "No port specified"
             raise ValueError("No port specified")
         try:
             self._ser = serial.Serial(self.port, self.baud, bytesize=serial.EIGHTBITS,
                                       parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
                                       timeout=self.timeout)
-            return True
-        except Exception:
+            # ensure port is actually open
+            if getattr(self._ser, 'is_open', False):
+                self.last_error = None
+                return True
+            else:
+                self.last_error = 'failed to open port'
+                try:
+                    self._ser.close()
+                except Exception:
+                    pass
+                self._ser = None
+                return False
+        except Exception as e:
+            # capture message for callers
+            self.last_error = str(e)
             self._ser = None
             return False
 
@@ -120,16 +139,56 @@ class SerialManager:
                 self._ser.close()
         finally:
             self._ser = None
+            self.last_error = None
 
     def send_line(self, text: str) -> bool:
         """Send a single line (adds CRLF). Returns True on success."""
         if self._ser is None or not getattr(self._ser, 'is_open', False):
+            self.last_error = 'port not open'
             return False
         try:
             payload = (text + "\r\n").encode("utf-8")
             self._ser.write(payload)
+            # attempt to flush if supported
+            try:
+                if hasattr(self._ser, 'flush'):
+                    self._ser.flush()
+            except Exception:
+                pass
+            self.last_error = None
             return True
         except Exception:
+            self.last_error = str(sys.exc_info()[1]) if 'sys' in globals() else 'write error'
+            return False
+
+    def pulse_dtr(self, duration: float = 0.2) -> bool:
+        """Pulse DTR line high for `duration` seconds if supported."""
+        if self._ser is None or not getattr(self._ser, 'is_open', False):
+            self.last_error = 'port not open'
+            return False
+        try:
+            self._ser.setDTR(True)
+            time.sleep(duration)
+            self._ser.setDTR(False)
+            self.last_error = None
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
+
+    def pulse_rts(self, duration: float = 0.2) -> bool:
+        """Pulse RTS line high for `duration` seconds if supported."""
+        if self._ser is None or not getattr(self._ser, 'is_open', False):
+            self.last_error = 'port not open'
+            return False
+        try:
+            self._ser.setRTS(True)
+            time.sleep(duration)
+            self._ser.setRTS(False)
+            self.last_error = None
+            return True
+        except Exception as e:
+            self.last_error = str(e)
             return False
 
 

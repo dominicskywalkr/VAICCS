@@ -34,6 +34,17 @@ class Splash(tk.Toplevel):
         try:
             ttk.Label(frm, text=title_text, font=(None, 14, 'bold')).pack()
             ttk.Label(frm, text=f"by {creator}", font=(None, 10)).pack()
+            # Display application version (if available from main.__version__)
+            try:
+                import main as mainmod
+                ver = getattr(mainmod, '__version__', None)
+            except Exception:
+                ver = None
+            try:
+                if ver:
+                    ttk.Label(frm, text=f"Version: {ver}", font=(None, 10)).pack()
+            except Exception:
+                pass
         except Exception:
             tk.Label(frm, text=title_text).pack()
             tk.Label(frm, text=f"by {creator}").pack()

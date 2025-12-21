@@ -18,6 +18,9 @@ try:
 except Exception:
     Punctuator = None
 
+# Application version. Update this when creating releases.
+__version__ = "1.0b2"
+
 # Configuration
 DEFAULT_MODEL_PATH = "model"
 SAMPLE_RATE = 16000
