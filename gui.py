@@ -5,6 +5,7 @@ import zipfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import queue
 import sounddevice as sd
 import requests
 import tarfile
@@ -14,6 +15,7 @@ import sys
 import webbrowser
 import subprocess
 import datetime
+import time
 import re
 from urllib.parse import quote, urlparse
 from main import CaptionEngine
@@ -67,7 +69,7 @@ class App(tk.Tk):
 
         # Set up the main window (kept hidden until splash is closed)
         self.title("VAICCS (Beta)")
-        self.geometry("900x800")
+        self.geometry("900x850")
 
         # Replace the default Tk icon (feather) with bundled `icon.ico` if available
         try:
@@ -93,6 +95,8 @@ class App(tk.Tk):
 
         # shared UI state
         self.auto_scroll_var = tk.BooleanVar(value=True)
+        # record of highlight events (for testing/diagnostics)
+        self._highlight_log = []
         # whether a bad words file has been loaded for this session (controls menu check)
         self._bad_words_loaded_var = tk.BooleanVar(value=False)
         # Auto-save transcript option
@@ -233,6 +237,51 @@ class App(tk.Tk):
         except Exception:
             pass
 
+        # Serial word delay (ms) - adjustable in Options dialog. Keep as IntVar
+        try:
+            default_ms = int((self._gui_settings or {}).get('serial_word_delay_ms', 200))
+        except Exception:
+            default_ms = 200
+        try:
+            self.serial_word_delay_ms = tk.IntVar(value=default_ms)
+        except Exception:
+            self.serial_word_delay_ms = tk.IntVar()
+            try:
+                self.serial_word_delay_ms.set(default_ms)
+            except Exception:
+                pass
+
+        # Serial highlight color setting (name); map names to bg/fg
+        try:
+            default_color = str((self._gui_settings or {}).get('serial_highlight_color', 'yellow'))
+        except Exception:
+            default_color = 'yellow'
+        try:
+            self.serial_highlight_color = tk.StringVar(value=default_color)
+        except Exception:
+            self.serial_highlight_color = tk.StringVar()
+            try:
+                self.serial_highlight_color.set(default_color)
+            except Exception:
+                pass
+
+        # mapping of friendly names to (bg, fg)
+        try:
+            self._serial_highlight_color_map = {
+                'gray': ('#808080', 'white'),
+                'dark red': ('#8B0000', 'white'),
+                'red': ('#FF0000', 'white'),
+                'orange': ('#FFA500', 'black'),
+                'yellow': ('#FFFF00', 'black'),
+                'green': ('#00AA00', 'white'),
+                'light blue': ('#ADD8E6', 'black'),
+                'blue': ('#0000FF', 'white'),
+                'indigo': ('#4B0082', 'white'),
+                'purple': ('#800080', 'white'),
+            }
+        except Exception:
+            self._serial_highlight_color_map = {}
+
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -371,6 +420,29 @@ class App(tk.Tk):
         except Exception:
             pass
         return None
+
+    def _set_window_icon(self, win):
+        """Set the application icon on a given window (Toplevel or root).
+        Uses the bundled icon.ico when available; falls back to PhotoImage.
+        """
+        try:
+            try:
+                icon_path = resources._resource_path('icon.ico')
+            except Exception:
+                icon_path = 'icon.ico'
+            if icon_path and os.path.exists(icon_path):
+                try:
+                    win.iconbitmap(icon_path)
+                except Exception:
+                    try:
+                        img = tk.PhotoImage(file=icon_path)
+                        win.iconphoto(False, img)
+                        # keep a reference so it isn't garbage-collected
+                        self._app_icon_image = img
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _log_button_states(self, reason: str = ""):
         """Lightweight debug print of Start/Stop button states."""
@@ -540,6 +612,13 @@ class App(tk.Tk):
 
         # serial manager
         self.serial_manager = None
+        # queue and worker for serial word-by-word sending
+        try:
+            self._serial_send_queue = queue.Queue()
+        except Exception:
+            self._serial_send_queue = None
+        self._serial_send_worker = None
+        self._serial_send_stop_event = None
         # mapping display -> device name (e.g. "COM3 - FTDI" -> "COM3")
         self._serial_display_map = {}
         # saved device loaded from settings (actual device name) to try to select after populating
@@ -775,8 +854,19 @@ class App(tk.Tk):
                     self.serial_manager.close()
             except Exception:
                 pass
-            self.serial_manager = None
-            self.serial_status_var.set("Serial: disabled")
+            # stop worker and clear queue
+            try:
+                self._stop_serial_worker()
+            except Exception:
+                pass
+            try:
+                self.serial_manager = None
+            except Exception:
+                self.serial_manager = None
+            try:
+                self.serial_status_var.set("Serial: disabled")
+            except Exception:
+                pass
             # no automatic persistence
             return
 
@@ -821,6 +911,11 @@ class App(tk.Tk):
                 return
 
             self.serial_status_var.set(f"Serial: connected {port}@{baud}")
+            try:
+                # ensure worker is running to process queued captions
+                self._start_serial_worker()
+            except Exception:
+                pass
         except Exception as e:
             try:
                 self.serial_manager = None
@@ -859,6 +954,147 @@ class App(tk.Tk):
                     pass
         except Exception as e:
             messagebox.showerror("Serial", f"Serial send failed: {e}")
+
+    def _start_serial_worker(self):
+        """Start a background worker that processes `self._serial_send_queue` sequentially.
+        The worker will finish each queued caption (all words) before taking the next.
+        """
+        try:
+            if getattr(self, '_serial_send_queue', None) is None:
+                self._serial_send_queue = queue.Queue()
+        except Exception:
+            self._serial_send_queue = queue.Queue()
+
+        if getattr(self, '_serial_send_worker', None) is not None:
+            # already running
+            return
+
+        stop_evt = threading.Event()
+        self._serial_send_stop_event = stop_evt
+
+        def _worker_loop():
+            try:
+                while not stop_evt.is_set():
+                    try:
+                        item = self._serial_send_queue.get(timeout=0.25)
+                    except Exception:
+                        continue
+                    if item is None:
+                        continue
+                    text = item or ''
+                    sm = getattr(self, 'serial_manager', None)
+                    if not sm:
+                        # drop until reconnected
+                        continue
+
+                    # compute base_char_offset by locating the inserted text in the transcript
+                    try:
+                        buf = self.transcript.get('1.0', 'end-1c')
+                        pos = buf.rfind(text)
+                        base_pos = pos if pos >= 0 else None
+                    except Exception:
+                        base_pos = None
+
+                    # build word ranges
+                    ranges = []
+                    try:
+                        for m in re.finditer(r'\S+', text):
+                            ranges.append((m.start(), m.end(), m.group(0)))
+                    except Exception:
+                        offs = 0
+                        for w in (text or '').split():
+                            i = (text or '').find(w, offs)
+                            if i >= 0:
+                                ranges.append((i, i + len(w), w))
+                                offs = i + len(w)
+
+                    try:
+                        delay_ms = int(getattr(self, 'serial_word_delay_ms', tk.IntVar(value=200)).get())
+                    except Exception:
+                        delay_ms = 200
+
+                    # process every word in this caption fully
+                    for (st, ed, w) in ranges:
+                        if stop_evt.is_set():
+                            break
+
+                        # compute absolute indices relative to 1.0 if base_pos known
+                        sidx = None
+                        eidx = None
+                        try:
+                            if base_pos is not None:
+                                sidx = f"1.0 + {base_pos + st}c"
+                                eidx = f"1.0 + {base_pos + ed}c"
+                        except Exception:
+                            sidx = None
+                            eidx = None
+
+                        # schedule highlight on main thread
+                        try:
+                            if sidx is not None and eidx is not None:
+                                try:
+                                    self.safe_after(0, lambda si=sidx, ei=eidx, w=w: self._apply_serial_highlight(si, ei, w))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # send word
+                        try:
+                            ok = bool(sm.send_line(w))
+                            if not ok:
+                                try:
+                                    self.serial_status_var.set("Serial send failed (port closed or write error)")
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            try:
+                                self.serial_status_var.set(f"Serial send error: {e}")
+                            except Exception:
+                                pass
+
+                        # wait configured delay
+                        waited = 0.0
+                        step = 0.05
+                        total = max(0.0, float(delay_ms) / 1000.0)
+                        while waited < total:
+                            if stop_evt.is_set():
+                                break
+                            time.sleep(min(step, total - waited))
+                            waited += step
+
+                    # done with this caption; loop to next queued caption
+            finally:
+                try:
+                    # clear worker ref
+                    self._serial_send_worker = None
+                except Exception:
+                    pass
+
+        th = threading.Thread(target=_worker_loop, daemon=True)
+        self._serial_send_worker = th
+        th.start()
+
+    def _stop_serial_worker(self):
+        try:
+            evt = getattr(self, '_serial_send_stop_event', None)
+            if evt is not None:
+                try:
+                    evt.set()
+                except Exception:
+                    pass
+            try:
+                if getattr(self, '_serial_send_queue', None) is not None:
+                    # drain queue
+                    try:
+                        while True:
+                            self._serial_send_queue.get_nowait()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _browse_model(self):
         path = filedialog.askdirectory(title="Select VOSK model directory")
@@ -1070,6 +1306,48 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _apply_serial_highlight(self, sidx, eidx, word=None):
+        """Apply the serial highlight tag on the main thread using normalized indices."""
+        try:
+            # normalize/validate indices
+            try:
+                ns = self.transcript.index(sidx)
+                ne = self.transcript.index(eidx)
+            except Exception:
+                ns = None
+                ne = None
+            if ns and ne:
+                try:
+                    # configure tag colors
+                    try:
+                        sel = str(getattr(self, 'serial_highlight_color', tk.StringVar(value='yellow')).get())
+                    except Exception:
+                        sel = 'yellow'
+                    bg, fg = self._serial_highlight_color_map.get(sel, (sel, 'black'))
+                    self.transcript.tag_config('serial_send', background=bg, foreground=fg)
+                except Exception:
+                    pass
+                try:
+                    # remove prev then add
+                    try:
+                        self.transcript.tag_remove('serial_send', '1.0', tk.END)
+                    except Exception:
+                        pass
+                    self.transcript.tag_add('serial_send', ns, ne)
+                except Exception:
+                    pass
+                try:
+                    if word:
+                        self.serial_status_var.set(f"Highlight: {word}")
+                        try:
+                            self.safe_after(500, lambda: self.serial_status_var.set(f"Serial: connected" if getattr(self, 'serial_manager', None) else "Serial: disconnected"))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _on_toggle_auto_check_updates(self):
         """Persist the user's preference for automatic update checks."""
         try:
@@ -1141,46 +1419,74 @@ class App(tk.Tk):
                 return
 
             if resp.status_code != 200:
-                # Attempt a web-fallback: fetch the releases page HTML and find the first
-                # occurrence of "/releases/tag/<tag>" which usually points to the latest release.
+                # The `/releases/latest` endpoint will not return pre-releases or drafts.
+                # Try the releases list API (includes published prereleases) and pick
+                # the most-recent entry. Fall back to the original HTML-scrape behavior
+                # if the API list call fails.
                 try:
-                    releases_page = 'https://github.com/dominicskywalkr/VAICCS/releases'
-                    r3 = requests.get(releases_page, timeout=10)
-                    tag = ''
-                    if r3.status_code == 200 and r3.text:
+                    list_api = 'https://api.github.com/repos/dominicskywalkr/VAICCS/releases'
+                    rlist = requests.get(list_api, headers=headers, timeout=10)
+                    if rlist.status_code == 200 and rlist.text:
                         try:
-                            # look for links to releases with tag in href
-                            m = re.search(r'/releases?/tag/([^"\'\s>]+)', r3.text)
-                            if m:
-                                tag = m.group(1)
+                            ldata = rlist.json() or []
+                            if isinstance(ldata, list) and len(ldata) > 0:
+                                # Choose the first release in the list (most-recent).
+                                data = ldata[0]
+                            else:
+                                data = None
                         except Exception:
-                            tag = ''
-
-                    if tag:
-                        latest_ver = re.sub(r'^v', '', tag, flags=re.IGNORECASE)
-                        data = {'name': tag, 'body': ''}
+                            data = None
                     else:
-                        if manual:
-                            reason = f'HTTP {resp.status_code}'
-                            try:
-                                rl = resp.headers.get('X-RateLimit-Remaining')
-                                if rl is not None:
-                                    reason += f' (rate limit remaining: {rl})'
-                            except Exception:
-                                pass
-                            try:
-                                messagebox.showinfo('Updates', f'Failed to determine latest release from GitHub (API {reason}).\nOpening releases page in your browser.')
-                            except Exception:
-                                pass
-                            try:
-                                webbrowser.open(releases_page)
-                            except Exception:
-                                pass
-                        return
+                        data = None
+
+                    if not data:
+                        # Attempt a web-fallback: fetch the releases page HTML and find the first
+                        # occurrence of "/releases/tag/<tag>" which usually points to the latest release.
+                        releases_page = 'https://github.com/dominicskywalkr/VAICCS/releases'
+                        try:
+                            r3 = requests.get(releases_page, timeout=10)
+                            tag = ''
+                            if r3.status_code == 200 and r3.text:
+                                try:
+                                    # look for links to releases with tag in href
+                                    m = re.search(r'/releases?/tag/([^"\'\s>]+)', r3.text)
+                                    if m:
+                                        tag = m.group(1)
+                                except Exception:
+                                    tag = ''
+
+                            if tag:
+                                latest_ver = re.sub(r'^v', '', tag, flags=re.IGNORECASE)
+                                data = {'name': tag, 'body': ''}
+                            else:
+                                if manual:
+                                    reason = f'HTTP {resp.status_code}'
+                                    try:
+                                        rl = resp.headers.get('X-RateLimit-Remaining')
+                                        if rl is not None:
+                                            reason += f' (rate limit remaining: {rl})'
+                                    except Exception:
+                                        pass
+                                    try:
+                                        messagebox.showinfo('Updates', f'Failed to determine latest release from GitHub (API {reason}).\nOpening releases page in your browser.')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        webbrowser.open(releases_page)
+                                    except Exception:
+                                        pass
+                                return
+                        except Exception:
+                            if manual:
+                                try:
+                                    messagebox.showinfo('Updates', 'Failed to check for updates (web fallback error).')
+                                except Exception:
+                                    pass
+                            return
                 except Exception:
                     if manual:
                         try:
-                            messagebox.showinfo('Updates', 'Failed to check for updates (web fallback error).')
+                            messagebox.showinfo('Updates', 'Failed to check for updates (releases list error).')
                         except Exception:
                             pass
                     return
@@ -1449,6 +1755,10 @@ class App(tk.Tk):
     def _show_update_dialog(self, current, latest, changelog, asset_url, releases_page, asset_name=None):
         try:
             w = tk.Toplevel(self)
+            try:
+                self._set_window_icon(w)
+            except Exception:
+                pass
             # Make dialog transient/modal above the main window
             try:
                 w.transient(self)
@@ -1487,6 +1797,15 @@ class App(tk.Tk):
             def _download_and_run_cb():
                 # If an actual asset URL is provided, download it; otherwise open releases page
                 if asset_url:
+                    try:
+                        # if the update dialog is modal (grab_set), release it so the
+                        # download dialog can accept events.
+                        try:
+                            w.grab_release()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                     self._download_and_run(asset_url, asset_name)
                 else:
                     try:
@@ -1536,6 +1855,15 @@ class App(tk.Tk):
 
             # Prepare progress dialog
             dlg = tk.Toplevel(self)
+            try:
+                self._set_window_icon(dlg)
+            except Exception:
+                pass
+            try:
+                dlg.transient(self)
+                dlg.grab_set()
+            except Exception:
+                pass
             dlg.title('Downloading')
             dlg.geometry('500x140')
             ttk.Label(dlg, text='Downloading installer...').pack(anchor='w', padx=10, pady=(10, 2))
@@ -1576,6 +1904,49 @@ class App(tk.Tk):
                 fd = None
                 tmp_path = None
                 try:
+                    # Helper functions to safely update UI widgets from background thread
+                    def _safe_set_status(text):
+                        try:
+                            if status_lbl and status_lbl.winfo_exists():
+                                status_lbl.config(text=text)
+                        except Exception:
+                            pass
+
+                    def _safe_set_pb_mode(mode):
+                        try:
+                            if pb and pb.winfo_exists():
+                                pb.config(mode=mode)
+                        except Exception:
+                            pass
+
+                    def _safe_start_pb():
+                        try:
+                            if pb and pb.winfo_exists():
+                                pb.start(10)
+                        except Exception:
+                            pass
+
+                    def _safe_stop_pb():
+                        try:
+                            if pb and pb.winfo_exists():
+                                pb.stop()
+                        except Exception:
+                            pass
+
+                    def _safe_set_progress(val):
+                        try:
+                            if progress_var is not None:
+                                progress_var.set(val)
+                        except Exception:
+                            pass
+
+                    def _safe_enable_run(cmd):
+                        try:
+                            if run_btn and run_btn.winfo_exists():
+                                run_btn.config(state='normal', command=cmd)
+                        except Exception:
+                            pass
+
                     with requests.get(url, stream=True, timeout=30) as r:
                         if r.status_code != 200:
                             self.after(0, lambda: messagebox.showerror('Download', f'Failed to download: HTTP {r.status_code}'))
@@ -1597,9 +1968,9 @@ class App(tk.Tk):
                         # choose determinate or indeterminate
                         if total > 0:
                             # set maximum to total bytes and update in bytes
-                            self.after(0, lambda: pb.config(mode='determinate'))
+                            self.after(0, lambda: _safe_set_pb_mode('determinate'))
                         else:
-                            self.after(0, lambda: (pb.config(mode='indeterminate'), pb.start(10)))
+                            self.after(0, lambda: (_safe_set_pb_mode('indeterminate'), _safe_start_pb()))
 
                         with os.fdopen(fd, 'wb') as outf:
                             for chunk in r.iter_content(8192):
@@ -1615,12 +1986,12 @@ class App(tk.Tk):
                                     downloaded += len(chunk)
                                     if total > 0:
                                         percent = (downloaded / total) * 100.0
-                                        self.after(0, lambda p=percent: progress_var.set(p))
-                                        self.after(0, lambda d=downloaded: status_lbl.config(text=f'{d} / {total} bytes'))
+                                        self.after(0, lambda p=percent: _safe_set_progress(p))
+                                        self.after(0, lambda d=downloaded: _safe_set_status(f'{d} / {total} bytes'))
                         # if indeterminate, stop the animation
                         if total <= 0:
                             try:
-                                self.after(0, lambda: pb.stop())
+                                self.after(0, lambda: _safe_stop_pb())
                             except Exception:
                                 pass
 
@@ -1639,7 +2010,8 @@ class App(tk.Tk):
 
                         # finished successfully
                         try:
-                            status_lbl.config(text=f'Download complete: {tmp_path}')
+                            # Update UI on main thread
+                            self.after(0, lambda: _safe_set_status(f'Download complete: {tmp_path}'))
                         except Exception:
                             pass
 
@@ -1658,7 +2030,7 @@ class App(tk.Tk):
 
                         # enable run button
                         try:
-                            self.after(0, lambda: run_btn.config(state='normal', command=_run_installer))
+                            self.after(0, lambda: _safe_enable_run(_run_installer))
                         except Exception:
                             pass
 
@@ -1698,6 +2070,8 @@ class App(tk.Tk):
                     "serial_enabled": bool(self.serial_enabled_var.get()),
                     "serial_port": device_name,
                     "baud": int(self.baud_var.get()),
+                    "serial_word_delay_ms": int(getattr(self, 'serial_word_delay_ms', tk.IntVar(value=200)).get()),
+                    "serial_highlight_color": str(getattr(self, 'serial_highlight_color', tk.StringVar(value='yellow')).get()),
                 "profile_matching": bool(self.profile_matching_var.get()),
                 "profile_threshold": float(self.profile_threshold_var.get()),
                 "srt_caption_duration": float(getattr(self, 'srt_duration_var', tk.DoubleVar(value=2.0)).get() if getattr(self, 'srt_duration_var', None) is not None else 2.0),
@@ -1929,6 +2303,36 @@ class App(tk.Tk):
                 if sp:
                     self._saved_serial_device = sp
                 self.baud_var.set(int(data.get("baud", 9600)))
+                # serial word delay (ms) if present
+                try:
+                    ms = data.get('serial_word_delay_ms')
+                    if ms is not None:
+                        try:
+                            if getattr(self, 'serial_word_delay_ms', None) is None:
+                                self.serial_word_delay_ms = tk.IntVar()
+                            self.serial_word_delay_ms.set(int(ms))
+                        except Exception:
+                            try:
+                                self.serial_word_delay_ms = tk.IntVar(value=int(ms))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                    # serial highlight color if present
+                    try:
+                        col = data.get('serial_highlight_color')
+                        if col is not None:
+                            try:
+                                if getattr(self, 'serial_highlight_color', None) is None:
+                                    self.serial_highlight_color = tk.StringVar()
+                                self.serial_highlight_color.set(str(col))
+                            except Exception:
+                                try:
+                                    self.serial_highlight_color = tk.StringVar(value=str(col))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 # restore SRT duration if present
                 try:
                     if getattr(self, 'srt_duration_var', None) is None:
@@ -2341,6 +2745,64 @@ class App(tk.Tk):
             ent = ttk.Entry(frm, textvariable=tmp_var, width=8)
             ent.pack(anchor=tk.W, pady=(4,6))
 
+        # Serial send speed (ms between words)
+        try:
+            ttk.Label(frm, text="Serial send delay (ms):").pack(anchor=tk.W)
+            tmp_serial_delay = tk.IntVar(value=int(getattr(self, 'serial_word_delay_ms', tk.IntVar(value=200)).get()))
+            try:
+                sd_spin = ttk.Spinbox(frm, from_=0, to=5000, increment=50, textvariable=tmp_serial_delay, width=8)
+                sd_spin.pack(anchor=tk.W, pady=(4,6))
+            except Exception:
+                sd_ent = ttk.Entry(frm, textvariable=tmp_serial_delay, width=8)
+                sd_ent.pack(anchor=tk.W, pady=(4,6))
+        except Exception:
+            tmp_serial_delay = None
+
+        # Highlight color chooser (small swatches)
+        try:
+            ttk.Label(frm, text="Highlight color:").pack(anchor=tk.W)
+            sw_frm = ttk.Frame(frm)
+            sw_frm.pack(anchor=tk.W, pady=(4,6))
+            tmp_serial_color = tk.StringVar(value=str(getattr(self, 'serial_highlight_color', tk.StringVar(value='yellow')).get()))
+            sw_buttons = {}
+
+            def _select_color(name):
+                try:
+                    tmp_serial_color.set(name)
+                except Exception:
+                    pass
+                try:
+                    # update visuals
+                    for n, b in sw_buttons.items():
+                        try:
+                            if n == tmp_serial_color.get():
+                                b.config(relief='sunken', bd=3)
+                            else:
+                                b.config(relief='raised', bd=1)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # create swatches in the requested order
+            color_order = ['gray','dark red','red','orange','yellow','green','light blue','blue','indigo','purple']
+            for name in color_order:
+                try:
+                    bg, fg = self._serial_highlight_color_map.get(name, (name, 'black'))
+                    b = tk.Button(sw_frm, bg=bg, activebackground=bg, width=3, height=1, command=lambda n=name: _select_color(n))
+                    b.pack(side=tk.LEFT, padx=(2,2))
+                    sw_buttons[name] = b
+                except Exception:
+                    pass
+
+            # initialize visuals
+            try:
+                _select_color(tmp_serial_color.get())
+            except Exception:
+                pass
+        except Exception:
+            tmp_serial_color = None
+
         btn_frm = ttk.Frame(frm)
         # place the buttons at the bottom-right corner of the dialog
         btn_frm.pack(side=tk.BOTTOM, anchor=tk.E, fill=tk.X, pady=(8,0))
@@ -2569,6 +3031,56 @@ class App(tk.Tk):
                 pass
             try:
                 dlg.destroy()
+            except Exception:
+                pass
+            # persist serial word delay into GUI settings
+            try:
+                if tmp_serial_delay is not None:
+                    try:
+                        ms = int(tmp_serial_delay.get())
+                    except Exception:
+                        ms = int(getattr(self, 'serial_word_delay_ms', tk.IntVar(value=200)).get())
+                    try:
+                        # update runtime var
+                        self.serial_word_delay_ms.set(max(0, ms))
+                    except Exception:
+                        try:
+                            self.serial_word_delay_ms = tk.IntVar(value=max(0, ms))
+                        except Exception:
+                            pass
+                    # persist into gui settings
+                    try:
+                        s = self._gui_settings or {}
+                        s['serial_word_delay_ms'] = int(ms)
+                        self._gui_settings = s
+                        self._save_gui_settings()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # persist serial highlight color
+            try:
+                if tmp_serial_color is not None:
+                    try:
+                        sel = str(tmp_serial_color.get())
+                    except Exception:
+                        sel = str(getattr(self, 'serial_highlight_color', tk.StringVar(value='yellow')).get())
+                    try:
+                        if getattr(self, 'serial_highlight_color', None) is None:
+                            self.serial_highlight_color = tk.StringVar()
+                        self.serial_highlight_color.set(sel)
+                    except Exception:
+                        try:
+                            self.serial_highlight_color = tk.StringVar(value=sel)
+                        except Exception:
+                            pass
+                    try:
+                        s = self._gui_settings or {}
+                        s['serial_highlight_color'] = sel
+                        self._gui_settings = s
+                        self._save_gui_settings()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -3782,6 +4294,21 @@ class App(tk.Tk):
             punctuator=(self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else None),
         )
 
+        # If punctuator failed to initialize with diagnostics, surface a warning
+        try:
+            p = getattr(self.engine, '_punctuator', None)
+            init_err = getattr(p, 'init_error', None)
+            if init_err:
+                try:
+                    messagebox.showwarning("Punctuator initialization", f"Punctuator warning:\n{init_err}")
+                except Exception:
+                    try:
+                        print("Punctuator init warning:\n", init_err)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         try:
             print("[UI] start_capture: created CaptionEngine, about to show loading dialog and start async")
         except Exception:
@@ -3829,6 +4356,18 @@ class App(tk.Tk):
                 pass
             try:
                 self._log_button_states("engine started (_on_started)")
+            except Exception:
+                pass
+            # If the engine's punctuator had initialization diagnostics, show them now
+            try:
+                p_err = None
+                if getattr(self, 'engine', None) is not None:
+                    p_err = getattr(self.engine, '_punctuator_init_error', None)
+                if p_err:
+                    try:
+                        messagebox.showwarning("Punctuator initialization", f"Punctuator warning:\n{p_err}")
+                    except Exception:
+                        print("Punctuator init warning:\n", p_err)
             except Exception:
                 pass
 
@@ -3953,7 +4492,24 @@ class App(tk.Tk):
                     pass
                 return
 
-            self.transcript.insert(tk.END, text + "\n")
+            # Insert the text and compute its absolute character offset within the widget
+            try:
+                self.transcript.insert(tk.END, text + "\n")
+            except Exception:
+                try:
+                    self.transcript.insert('end', text + "\n")
+                except Exception:
+                    pass
+            # Compute the base character index (offset from 1.0) where this inserted text appears
+            base_char_offset = None
+            try:
+                buf = self.transcript.get('1.0', 'end-1c')
+                # prefer the last occurrence in case same line appears earlier
+                pos = buf.rfind(text)
+                if pos >= 0:
+                    base_char_offset = pos
+            except Exception:
+                base_char_offset = None
             try:
                 # auto-scroll to the end so new captions are visible (if enabled)
                 if getattr(self, 'auto_scroll_var', None) and self.auto_scroll_var.get():
@@ -3963,21 +4519,48 @@ class App(tk.Tk):
 
             # forward to serial if enabled
             try:
-                    sm = getattr(self, 'serial_manager', None)
-                    if sm and getattr(self, 'serial_enabled_var', None) and self.serial_enabled_var.get():
+                sm = getattr(self, 'serial_manager', None)
+                if sm and getattr(self, 'serial_enabled_var', None) and self.serial_enabled_var.get():
+                    try:
+                        # enqueue caption text for the serial worker which will finish lines sequentially
                         try:
-                            ok = bool(sm.send_line(text))
-                            if not ok:
-                                self.serial_status_var.set("Serial send failed (port closed or write error)")
+                            if getattr(self, '_serial_send_queue', None) is None:
+                                self._serial_send_queue = queue.Queue()
+                        except Exception:
+                            self._serial_send_queue = queue.Queue()
+                        try:
+                            self._serial_send_queue.put(text)
+                            # ensure a worker is running to process the queue
+                            try:
+                                self._start_serial_worker()
+                            except Exception:
+                                pass
                         except Exception as e:
-                            self.serial_status_var.set(f"Serial send error: {e}")
+                            try:
+                                self.serial_status_var.set(f"Serial enqueue error: {e}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
         try:
-            self.safe_after(0, _handle)
-        except RuntimeError:
-            # No Tk main loop is running (headless test). Call handler directly
+            # If called from the main thread, run handler directly for immediate UI updates
+            if threading.current_thread() is threading.main_thread():
+                try:
+                    _handle()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.safe_after(0, _handle)
+                except RuntimeError:
+                    try:
+                        _handle()
+                    except Exception:
+                        pass
+        except Exception:
             try:
                 _handle()
             except Exception:

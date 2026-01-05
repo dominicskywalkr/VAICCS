@@ -56,11 +56,25 @@ if sys.platform == 'win32':
 # Merge vosk binaries with any extra DLLs we found
 all_binaries = (vosk_binaries or []) + extra_binaries
 
+# data files: config and icon; we'll append all files under `media/` next
+datas = [
+    ('cryptolens_config.json', '.'),
+    ('icon.ico', '.'),
+]
+
+# Add everything under media/ (preserve folder structure inside the bundle)
+if os.path.isdir('media'):
+    for _root, _dirs, _files in os.walk('media'):
+        for _f in _files:
+            _src = os.path.join(_root, _f)
+            _dest = os.path.relpath(_root, '.')
+            datas.append((_src, _dest))
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],
     binaries=all_binaries,
-    datas=[],
+    datas=datas,
     hiddenimports=vosk_hidden,
     hookspath=[],
     hooksconfig={},

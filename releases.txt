@@ -7,3 +7,15 @@ VAICCS 1.0 Beta 2
 - Added "Check for Updates" feature under Help dropdown in Top bar
 - Added showing the version of the program on the splash screen and Help: About window
 - Fixed the serial output feature. There would be no output seen when the "Send test" button or when spoken word is said.
+
+VAICCS 1.0 Beta 3
+
+- Fixed "Check for Updates" dialogue so that it would show the Release notes properly.
+- Fixed if a user wanted to cancel a download of a update. Previously the cancel button didn't work.
+- Put the proper VAICCS icon on the top left hand corner in the "Check for Updates" and "download" windows.
+- Made improvements on the Punctuator. NOTE, using the “gigaspeech” model file will not work properly alongside the Punctuator if that has a model loaded in as well.
+- Added the feature where one word at a time goes though the serial output when Vosk outputs words sentences/paragraphs at a time (previously whole paragraphs would be pushed to a closed caption encoder all at once)
+- When a word is being sent through the serial output, it gets highlighted in the main tab
+- Added multiple highlighter color options
+- Adjusted default main window size 
+- Compiled using Python 3.13.11
