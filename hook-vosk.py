@@ -4,7 +4,10 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 import os
 import glob
 
-hiddenimports = collect_submodules('vosk')
+# IMPORTANT: `collect_submodules('vosk')` does not reliably include the top-level
+# package itself. Ensure `vosk` is explicitly included so the package directory
+# and `__init__.py` are bundled.
+hiddenimports = ['vosk'] + collect_submodules('vosk')
 
 # collect_data_files will grab non-python files under the package (models aren't packaged,
 # but the native library (.dll/.pyd) that vosk uses may be present under site-packages).

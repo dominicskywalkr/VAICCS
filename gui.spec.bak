@@ -1,0 +1,351 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""
+Mac-only PyInstaller spec for building `launcher.py` as a single-file
+application bundled into a macOS .app. This spec intentionally omits any
+Windows-specific code.
+Place `icon.icns` (preferred) or `icon.ico` at repository root to include
+an application icon in the resulting .app Resources directory.
+"""
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+import os
+import sys
+
+# Collect native binaries / hiddenimports for optional packages
+vosk_binaries = collect_dynamic_libs('vosk') or []
+vosk_hidden = collect_submodules('vosk') or []
+
+# Ensure sounddevice is collected (native extension + any dynamic libs)
+sd_binaries = collect_dynamic_libs('sounddevice') or []
+sd_hidden = collect_submodules('sounddevice') or []
+
+all_binaries = list(vosk_binaries) + list(sd_binaries)
+
+# collect any extra data files to include (populated below if we find a
+# real libvosk file on the build machine)
+extra_datas = []
+
+# If the vosk package ships a native lib that wasn't auto-collected, try to
+# locate it in the installed vosk package and include it explicitly.
+try:
+    import importlib, importlib.util
+    spec = importlib.util.find_spec('vosk')
+    if spec and getattr(spec, 'origin', None):
+        vosk_pkg_dir = os.path.dirname(spec.origin)
+        for name in ('libvosk.dyld', 'libvosk.dylib'):
+            maybe = os.path.join(vosk_pkg_dir, name)
+            # Some vosk installations ship a directory named `libvosk.dyld`
+            # which itself contains the actual dylib file `libvosk.dyld`.
+            # In that case we must copy the inner file into the bundle as
+            # `vosk/libvosk.dyld` (a regular file). Otherwise copy the file
+            # directly if present.
+            try:
+                if os.path.isdir(maybe):
+                    inner = os.path.join(maybe, name)
+                    if os.path.exists(inner) and not os.path.islink(inner):
+                        all_binaries.append((inner, os.path.join('vosk', name)))
+                        break
+                elif os.path.exists(maybe) and not os.path.islink(maybe):
+                    all_binaries.append((maybe, os.path.join('vosk', name)))
+                    break
+            except Exception:
+                continue
+except Exception:
+    pass
+
+# Normalize `all_binaries`: ensure every entry references a real file (not a
+# directory). If an entry points to a directory (e.g. `libvosk.dyld` bundle),
+# attempt to locate the inner dylib file and use that instead. Skip entries
+# that cannot be resolved to a regular file.
+try:
+    normalized = []
+    for entry in list(all_binaries):
+        src = None
+        dest = None
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            src, dest = entry[0], entry[1]
+        elif isinstance(entry, str):
+            src = entry
+            dest = os.path.basename(entry)
+        else:
+            continue
+
+        # If src is a directory (common for some macOS bundles), try to
+        # find the inner file with the same basename, else find any file inside.
+        if os.path.isdir(src):
+            base = os.path.basename(src)
+            candidate = os.path.join(src, base)
+            if os.path.exists(candidate) and os.path.isfile(candidate) and not os.path.islink(candidate):
+                src = candidate
+            else:
+                found = None
+                for r, _dirs, files in os.walk(src):
+                    for f in files:
+                        fp = os.path.join(r, f)
+                        if os.path.isfile(fp):
+                            found = fp
+                            break
+                    if found:
+                        break
+                if found:
+                    src = found
+                else:
+                    # Could not resolve directory to a file; skip this entry
+                    continue
+
+        # Ensure final src is a regular file and not a symlink
+        if os.path.exists(src) and os.path.isfile(src) and not os.path.islink(src):
+            normalized.append((src, dest))
+
+    all_binaries = normalized
+except Exception:
+    pass
+
+# As a last-resort, include the development virtualenv's vosk dylib when
+# present. This ensures the build machine's `.venv` copy of `libvosk.dyld`
+# (or `.dylib`) is added explicitly when auto-discovery misses it.
+try:
+    venv_root = os.path.abspath('.')
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    venv_candidate = os.path.join(venv_root, '.venv', 'lib', pyver, 'site-packages', 'vosk')
+    if os.path.isdir(venv_candidate):
+        for vname in ('libvosk.dyld', 'libvosk.dylib'):
+            vcand = os.path.join(venv_candidate, vname)
+            if os.path.isdir(vcand):
+                inner = os.path.join(vcand, vname)
+                if os.path.exists(inner) and os.path.isfile(inner) and not os.path.islink(inner):
+                    all_binaries.append((inner, os.path.join('vosk', vname)))
+                    extra_datas.append((inner, os.path.join('vosk')))
+                    break
+            if os.path.exists(vcand) and os.path.isfile(vcand) and not os.path.islink(vcand):
+                all_binaries.append((vcand, os.path.join('vosk', vname)))
+                extra_datas.append((vcand, os.path.join('vosk')))
+                break
+except Exception:
+    pass
+
+# Ensure we explicitly locate the real Vosk native library file (not a
+# symlink or empty directory) from the installed `vosk` package on the
+# build machine. This searches `sys.path` for a `vosk` package and, when
+# it finds an actual dylib file, adds it to `all_binaries` so PyInstaller
+# places the real file at `vosk/libvosk.dyld` (or `.dylib`) inside the
+# bundle. This avoids packaging an empty directory or symlink that causes
+# dlopen() to fail at runtime.
+try:
+    import sys as _sys
+    for _p in list(_sys.path):
+        try:
+            vosk_pkg = os.path.join(_p, 'vosk')
+            if not os.path.isdir(vosk_pkg):
+                continue
+            for _name in ('libvosk.dyld', 'libvosk.dylib', 'libvosk.so', 'libvosk.dll'):
+                cand = os.path.join(vosk_pkg, _name)
+                # If the package ships a directory named like `libvosk.dyld`,
+                # look for the inner file.
+                if os.path.isdir(cand):
+                    inner = os.path.join(cand, _name)
+                    if os.path.exists(inner) and os.path.isfile(inner) and not os.path.islink(inner):
+                        all_binaries.append((inner, os.path.join('vosk', os.path.basename(_name))))
+                        extra_datas.append((inner, os.path.join('vosk')))
+                        raise StopIteration
+                # Otherwise if the file exists and is a real file, add it.
+                if os.path.exists(cand) and os.path.isfile(cand) and not os.path.islink(cand):
+                    all_binaries.append((cand, os.path.join('vosk', os.path.basename(_name))))
+                    extra_datas.append((cand, os.path.join('vosk')))
+                    raise StopIteration
+        except StopIteration:
+            break
+        except Exception:
+            continue
+except Exception:
+    pass
+
+# Gather datas: include config, icons, media/, models/ and any other data files
+datas = []
+if os.path.exists('cryptolens_config.json'):
+    datas.append(('cryptolens_config.json', '.'))
+
+# Add any extra datas discovered earlier (e.g., real libvosk file)
+try:
+    if extra_datas:
+        for ed in extra_datas:
+            datas.append(ed)
+except Exception:
+    pass
+
+# Force-include the development venv's `libvosk.dyld` into datas so it
+# lands in the app Resources where our runtime hook/launcher can copy it
+# into `Contents/Frameworks/vosk` at startup. This is a conservative
+# fallback when binary collection doesn't place the file in Frameworks.
+try:
+    venv_lib = os.path.abspath(os.path.join('.venv', 'lib', f"python{sys.version_info.major}.{sys.version_info.minor}", 'site-packages', 'vosk', 'libvosk.dyld'))
+    if os.path.exists(venv_lib) and os.path.isfile(venv_lib) and not os.path.islink(venv_lib):
+        # Place under Resources/vosk so it's easy to find at runtime
+        datas.append((venv_lib, os.path.join('vosk')))
+except Exception:
+    pass
+
+# Include both icon.icns and icon.ico when available; prefer .icns for the bundle
+icon_file = None
+if os.path.exists('icon.icns'):
+    datas.append(('icon.icns', '.'))
+    icon_file = 'icon.icns'
+if os.path.exists('icon.ico'):
+    # If we don't have an .icns, try to convert icon.ico -> icon.icns using Pillow.
+    # If Pillow isn't available or conversion fails, fall back to leaving icon.ico out
+    # for macOS (PyInstaller requires .icns on macOS bundles).
+    try:
+        is_darwin = sys.platform.startswith('darwin')
+    except Exception:
+        is_darwin = False
+
+    if is_darwin and icon_file is None:
+        try:
+            from PIL import Image
+            try:
+                im = Image.open('icon.ico')
+                # attempt save as icns (Pillow supports .icns when available)
+                im.save('icon.icns', format='ICNS')
+                if os.path.exists('icon.icns'):
+                    datas.append(('icon.icns', '.'))
+                    icon_file = 'icon.icns'
+            except Exception:
+                # conversion failed; do not set icon_file
+                pass
+        except Exception:
+            # Pillow not installed; do not include icon.ico for macOS
+            pass
+    else:
+        # Non-macOS or we already have icon.icns: include icon.ico as data for completeness
+        try:
+            datas.append(('icon.ico', '.'))
+            if icon_file is None:
+                icon_file = 'icon.ico'
+        except Exception:
+            pass
+
+# Recursively include media/ and models/ directories if present
+for folder in ('media', 'models'):
+    if os.path.isdir(folder):
+        for root, _dirs, files in os.walk(folder):
+            rel_dest = os.path.relpath(root, '.')
+            for f in files:
+                datas.append((os.path.join(root, f), rel_dest))
+
+# Also explicitly include a named model directory if present (helps ensure
+# a large model folder is packaged with a stable path inside the bundle).
+named_model = os.path.join('models', 'vosk-model-en-us-0.22-lgraph')
+if os.path.isdir(named_model):
+    for root, _dirs, files in os.walk(named_model):
+        rel_dest = os.path.join('models', os.path.relpath(root, 'models'))
+        for f in files:
+            datas.append((os.path.join(root, f), rel_dest))
+
+# Keep pathex explicit so PyInstaller resolves local imports
+pathex = [os.path.abspath('.')]
+
+a = Analysis(
+    ['launcher.py'],
+    pathex=pathex,
+    binaries=all_binaries,
+    datas=datas,
+    hiddenimports=list(set(vosk_hidden + sd_hidden + ['sounddevice'])),
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=['hooks/rth_vosk_fix.py'],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+
+# Sanitize collected binaries discovered by PyInstaller and from the spec.
+# Some collectors may add directory-like entries for macOS bundled dylibs
+# (e.g. `libvosk.dyld` as a directory). Replace such entries with the inner
+# real dylib file when possible, or drop them if unresolved.
+try:
+    # Only normalize binaries that look like the vosk native lib (basename
+    # contains 'libvosk' or destination path mentions 'vosk'). Preserve all
+    # other entries (e.g., Python.framework) untouched to avoid dropping
+    # essential framework directories.
+    preserved = []
+    for entry in list(a.binaries):
+        try:
+            src = entry[0] if isinstance(entry, (list, tuple)) and len(entry) >= 1 else entry
+            dest = entry[1] if isinstance(entry, (list, tuple)) and len(entry) >= 2 else os.path.basename(src)
+
+            name = os.path.basename(src)
+            if 'libvosk' in name or 'vosk' in str(dest).lower():
+                # If this entry is a directory bundle, try to resolve the inner
+                # dylib file; otherwise keep the file entry.
+                if os.path.isdir(src):
+                    base = os.path.basename(src)
+                    candidate = os.path.join(src, base)
+                    if os.path.exists(candidate) and os.path.isfile(candidate) and not os.path.islink(candidate):
+                        preserved.append((candidate, dest))
+                        continue
+                    found = None
+                    for r, _dirs, files in os.walk(src):
+                        for f in files:
+                            fp = os.path.join(r, f)
+                            if os.path.isfile(fp):
+                                found = fp
+                                break
+                        if found:
+                            break
+                    if found:
+                        preserved.append((found, dest))
+                        continue
+                    # Could not resolve; skip this entry to avoid directory copy errors
+                    continue
+                # Normal file entry for vosk
+                if os.path.exists(src) and os.path.isfile(src) and not os.path.islink(src):
+                    preserved.append((src, dest))
+                continue
+
+            # Non-vosk entries: keep as-is
+            preserved.append(entry)
+        except Exception:
+            preserved.append(entry)
+
+    a.binaries = preserved
+except Exception:
+    pass
+
+pyz = PYZ(a.pure, a.zipped_data)
+
+# Build an onedir layout (avoid onefile + .app issues), then wrap in a BUNDLE
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='VAICCS',
+    icon=icon_file,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    # Exclude the Vosk macOS native library from UPX compression
+    upx_exclude=['libvosk.dylib'],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=['libvosk.dylib'],
+    name='VAICCS',
+)
+
+# Wrap the collected onedir in a macOS .app bundle
+app = BUNDLE(
+    coll,
+    name='VAICCS.app',
+    icon=icon_file,
+    bundle_identifier='com.dominic.vaiccs',
+)

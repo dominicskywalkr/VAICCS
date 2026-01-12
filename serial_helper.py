@@ -1,7 +1,8 @@
 """Serial helper for sending captions to an external encoder.
 
-Provides a small `SerialManager` class to open/close a COM port and send
-lines. Also exposes `list_serial_ports()` to enumerate available COM ports.
+Provides a small `SerialManager` class to open/close a serial port and send
+lines. Also exposes `list_serial_ports()` to enumerate available serial ports
+on the host (e.g. COMx on Windows or /dev/tty.* on macOS/Linux).
 
 This module avoids opening a port at import time so importing it is safe
 when pyserial is not available; callers should handle missing dependency.
@@ -63,7 +64,7 @@ def list_serial_ports() -> List[str]:
                 while True:
                     try:
                         name, value, _ = winreg.EnumValue(k, i)
-                        # value is the COM port name (e.g., 'COM5')
+                        # value is the COM port name (e.g., 'COM5' on Windows)
                         dev = str(value)
                         # create an entry only if device not already present
                         if not any(r.get("device") == dev for r in results):

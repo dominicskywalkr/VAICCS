@@ -14,12 +14,16 @@ try:
 except Exception:
     np = None
 try:
-    from punctuator import Punctuator
+    try:
+        # Prefer a fixed local implementation if present
+        from punctuator import Punctuator
+    except Exception:
+        from punctuator import Punctuator
 except Exception:
     Punctuator = None
 
 # Application version. Update this when creating releases.
-__version__ = "1.0b2"
+__version__ = "1.0b4"
 
 # Configuration
 DEFAULT_MODEL_PATH = "model"
@@ -48,6 +52,18 @@ def _resource_path(relpath: str) -> str:
         p = os.path.join(os.getcwd(), relpath)
         if os.path.exists(p):
             return p
+    except Exception:
+        pass
+
+    # 2.5) macOS .app bundle Resources directory next to the executable
+    # When packaged as a .app, resources are usually placed in
+    # Contents/Resources relative to the executable at Contents/MacOS.
+    try:
+        exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        # typical layout: <App>.app/Contents/MacOS/<exe> -> Resources at ../Resources
+        mac_res = os.path.abspath(os.path.join(exe_dir, '..', 'Resources', relpath))
+        if os.path.exists(mac_res):
+            return mac_res
     except Exception:
         pass
 
@@ -278,13 +294,30 @@ class CaptionEngine:
         # buffer for raw audio bytes corresponding to the current utterance
         self._chunk_buffer = bytearray()
         # punctuator: optional path or model spec (e.g., 'hf:your-model-id')
+        # Defer heavy punctuator initialization (may download HF models)
+        # to `start()` so the GUI can show a loading dialog while it runs.
+        self._punctuator_path = punctuator
+        self._punctuator = None
+        self._punctuator_init_error = None
+
+    def _init_punctuator(self):
         try:
-            if Punctuator is not None:
-                self._punctuator = Punctuator.from_path(punctuator)
-            else:
+            if Punctuator is None:
                 self._punctuator = None
-        except Exception:
+                return
+            self._punctuator = Punctuator.from_path(self._punctuator_path)
+            # propagate init_error if present
+            try:
+                self._punctuator_init_error = getattr(self._punctuator, 'init_error', None)
+            except Exception:
+                self._punctuator_init_error = None
+        except Exception as e:
             self._punctuator = None
+            try:
+                import traceback as _tb
+                self._punctuator_init_error = _tb.format_exc()
+            except Exception:
+                self._punctuator_init_error = str(e)
 
     def _init_recognizer(self):
         # Determine whether to use recognizer
@@ -472,6 +505,12 @@ class CaptionEngine:
         _ensure_bad_words()
         self._callback = callback
         self._stop_event.clear()
+        # Initialize punctuator here (runs in engine.start thread when called
+        # from GUI's _start_engine_async) so downloads happen off the main thread
+        try:
+            self._init_punctuator()
+        except Exception:
+            pass
         self._init_recognizer()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()

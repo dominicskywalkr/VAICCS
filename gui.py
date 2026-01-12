@@ -25,6 +25,7 @@ from parse_vosk_headless import parse_vosk_models
 from parse_hance_headless import parse_hance_models
 import resources
 import noise_cancel
+import startup_options as startup_options_mod
 from automations import AutomationManager, ShowAutomation
 # Lightweight fallback logger used by some async download/extract codepaths.
 # The GUI also defines a more specific `_hlog` in scopes where a per-download
@@ -68,7 +69,7 @@ class App(tk.Tk):
             pass
 
         # Set up the main window (kept hidden until splash is closed)
-        self.title("VAICCS (Beta)")
+        self.title("VAICCS on MacOS (Beta)")
         self.geometry("900x850")
 
         # Replace the default Tk icon (feather) with bundled `icon.ico` if available
@@ -130,9 +131,10 @@ class App(tk.Tk):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Save Settings", accelerator="Ctrl+S", command=lambda: self._on_save_clicked())
-        file_menu.add_command(label="Save Settings As...", accelerator="Ctrl+Shift+S", command=lambda: self._on_save_as())
+        file_menu.add_command(label="Save Settings", accelerator="Command-S", command=lambda: self._on_save_clicked())
+        file_menu.add_command(label="Save Settings As...", accelerator="Command-Shift-S", command=lambda: self._on_save_as())
         file_menu.add_command(label="Options...", command=lambda: self._open_options_dialog())
+        file_menu.add_command(label="Startup Options", command=lambda: self._open_startup_options())
     # Transcript export/save options
         file_menu.add_command(label="Save Transcript As...", command=lambda: self._save_transcript_txt())
         file_menu.add_command(label="Export Transcript as SRT", command=lambda: self._export_transcript_srt())
@@ -147,9 +149,9 @@ class App(tk.Tk):
             self._bad_words_menu_index = file_menu.index("end")
         except Exception:
             self._bad_words_menu_index = None
-        file_menu.add_command(label="Load Settings...", accelerator="Ctrl+O", command=lambda: self._on_open_settings())
+        file_menu.add_command(label="Load Settings...", accelerator="Command-O", command=lambda: self._on_open_settings())
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", accelerator="Alt-F4", command=self.quit)
+        file_menu.add_command(label="Exit", accelerator="Command-Q", command=self.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
         # Bleep/replacement UI state: allow user to choose how bad words are replaced
@@ -187,7 +189,7 @@ class App(tk.Tk):
         help_menu.add_command(label="Activate", command=lambda: self._open_activate())
         help_menu.add_command(label="Check for Updates...", command=lambda: self._check_for_updates(manual=True))
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About",
-                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
+                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2026 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         try:
@@ -198,13 +200,23 @@ class App(tk.Tk):
 
         # Keyboard shortcuts
         try:
+            # Support both Control (Windows/Linux) and Command (macOS) shortcuts
             self.bind_all('<Control-s>', lambda e: self._on_save_clicked())
             self.bind_all('<Control-S>', lambda e: self._on_save_as())
             self.bind_all('<Control-Shift-S>', lambda e: self._on_save_as())
             self.bind_all('<Control-o>', lambda e: self._on_open_settings())
-            # Alt+F4 is normally handled by the window manager; add binding to ensure menu Exit is called
+
+            # macOS Command key equivalents
             try:
-                self.bind_all('<Alt-F4>', lambda e: self.quit())
+                self.bind_all('<Command-s>', lambda e: self._on_save_clicked())
+                self.bind_all('<Command-S>', lambda e: self._on_save_as())
+                self.bind_all('<Command-Shift-S>', lambda e: self._on_save_as())
+                self.bind_all('<Command-o>', lambda e: self._on_open_settings())
+            except Exception:
+                pass
+                # Provide Command-Q binding on macOS; Alt-F4 fallback removed
+            try:
+                self.bind_all('<Command-q>', lambda e: self.quit())
             except Exception:
                 pass
         except Exception:
@@ -444,6 +456,111 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _startup_json_path(self):
+        try:
+            return os.path.expanduser('~/Documents/VAICCS/startup.json')
+        except Exception:
+            return os.path.join(os.getcwd(), 'VAICCS', 'startup.json')
+
+    def _load_startup_json(self):
+        p = self._startup_json_path()
+        try:
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_startup_json(self, data: dict):
+        p = self._startup_json_path()
+        try:
+            d = os.path.dirname(p)
+            os.makedirs(d, exist_ok=True)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def _open_startup_options(self):
+        """Open a small dialog to choose startup options and persist to
+        ~/Documents/VAICCS/startup.json. The file will be automatically applied
+        at program start when present."""
+        dlg = tk.Toplevel(self)
+        try:
+            dlg.transient(self)
+        except Exception:
+            pass
+        dlg.title("Startup Options")
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
+        frm = ttk.Frame(dlg, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        # load existing values
+        cur = self._load_startup_json() or {}
+        save_val = cur.get('save', '')
+        auto_val = bool(cur.get('autostart', False))
+        show_val = bool(cur.get('show_error', False))
+
+        save_var = tk.StringVar(value=save_val)
+        auto_var = tk.BooleanVar(value=auto_val)
+        show_var = tk.BooleanVar(value=show_val)
+
+        # Save file chooser
+        ttk.Label(frm, text='Settings file to load at startup:').pack(anchor=tk.W)
+        sf = ttk.Frame(frm)
+        sf.pack(fill=tk.X, pady=(4,6))
+        try:
+            ttk.Entry(sf, textvariable=save_var, width=60).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        except Exception:
+            pass
+        def _choose_file():
+            try:
+                fn = filedialog.askopenfilename(title='Choose settings JSON', filetypes=[('JSON','*.json'),('All','*')])
+                if fn:
+                    save_var.set(fn)
+            except Exception:
+                pass
+        ttk.Button(sf, text='Browse...', command=_choose_file).pack(side=tk.LEFT, padx=(6,0))
+
+        # checkboxes
+        ttk.Checkbutton(frm, text='Autostart model at launch', variable=auto_var).pack(anchor=tk.W)
+        ttk.Checkbutton(frm, text='Show import/errors dialog on failure', variable=show_var).pack(anchor=tk.W)
+
+        # explanatory text
+        txt = ('If a startup.json file exists in your Documents/VAICCS folder, its options '
+               'will be automatically applied at program start. This dialog writes that file.')
+        ttk.Label(frm, text=txt, wraplength=480).pack(anchor=tk.W, pady=(8,6))
+
+        btn_frm = ttk.Frame(frm)
+        btn_frm.pack(fill=tk.X, pady=(8,0))
+        def _on_save():
+            data = {'save': save_var.get() or None, 'autostart': bool(auto_var.get()), 'show_error': bool(show_var.get())}
+            ok = self._save_startup_json(data)
+            try:
+                if ok:
+                    # immediately apply to current app (respecting license checks)
+                    try:
+                        startup_options_mod.apply_startup_options(self, data)
+                    except Exception:
+                        pass
+                else:
+                    messagebox.showerror('Startup Options', 'Failed to save startup.json')
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btn_frm, text='Save', command=_on_save).pack(side=tk.RIGHT, padx=(6,0))
+        ttk.Button(btn_frm, text='Cancel', command=lambda: dlg.destroy()).pack(side=tk.RIGHT)
+
     def _log_button_states(self, reason: str = ""):
         """Lightweight debug print of Start/Stop button states."""
         try:
@@ -473,9 +590,67 @@ class App(tk.Tk):
         self.transcript_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.transcript.config(yscrollcommand=self.transcript_scroll.set)
 
-        # Right: controls (1/4)
-        right = ttk.Frame(self.main_frame, width=250)
-        right.pack(side=tk.RIGHT, fill=tk.Y)
+        # Right: controls (1/4) -- use a scrollable canvas so narrow windows can access all controls
+        right_container = ttk.Frame(self.main_frame, width=250)
+        right_container.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Canvas + scrollbar
+        right_canvas = tk.Canvas(right_container, width=250, highlightthickness=0)
+        right_vscroll = ttk.Scrollbar(right_container, orient=tk.VERTICAL, command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_vscroll.set)
+        right_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Inner frame that will hold the actual controls
+        right = ttk.Frame(right_canvas)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor='nw')
+
+        # Ensure scrollregion is updated when inner frame changes size
+        def _update_right_scrollregion(event=None):
+            try:
+                right_canvas.configure(scrollregion=right_canvas.bbox('all'))
+            except Exception:
+                pass
+
+        right.bind('<Configure>', lambda e: _update_right_scrollregion())
+        # Ensure inner frame width matches canvas width
+        def _on_canvas_config(event):
+            try:
+                right_canvas.itemconfigure(right_window, width=event.width)
+            except Exception:
+                pass
+
+        right_canvas.bind('<Configure>', _on_canvas_config)
+
+        # Mousewheel scrolling when over the right pane
+        def _on_right_mousewheel(event):
+            try:
+                delta = getattr(event, 'delta', 0)
+                if delta:
+                    # On Windows delta is multiple of 120; on macOS trackpad often gives small values
+                    if abs(delta) >= 120:
+                        lines = int(-1 * (delta / 120))
+                    else:
+                        lines = -1 if delta > 0 else 1
+                    right_canvas.yview_scroll(lines, 'units')
+                    return
+                # X11 wheel events may come as Button-4 (up) / Button-5 (down)
+                num = getattr(event, 'num', None)
+                if num == 4:
+                    right_canvas.yview_scroll(-1, 'units')
+                elif num == 5:
+                    right_canvas.yview_scroll(1, 'units')
+            except Exception:
+                pass
+
+        # Bind wheel events on both the canvas and the inner frame so scrolling works
+        right_canvas.bind('<MouseWheel>', _on_right_mousewheel)
+        right.bind('<MouseWheel>', _on_right_mousewheel)
+        # X11 Linux
+        right_canvas.bind('<Button-4>', _on_right_mousewheel)
+        right_canvas.bind('<Button-5>', _on_right_mousewheel)
+        right.bind('<Button-4>', _on_right_mousewheel)
+        right.bind('<Button-5>', _on_right_mousewheel)
 
         self.start_btn = ttk.Button(right, text="Start", command=self.start_capture)
         self.start_btn.pack(pady=(20, 6), padx=8, fill=tk.X)
@@ -674,24 +849,42 @@ class App(tk.Tk):
             chosen = None
             if env_root:
                 chosen = env_root
-            elif script_dir and not _is_under_tmp(script_dir):
-                chosen = script_dir
-            elif exe_dir and not _is_under_tmp(exe_dir):
-                chosen = exe_dir
             else:
-                # Use LOCALAPPDATA if available for a persistent per-user folder
-                local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
-                if local:
-                    chosen = os.path.join(local, 'VAICCS')
+                # On macOS:
+                # - If packaged/frozen (.app), prefer a Models folder next to the executable
+                #   at <App>.app/Contents/MacOS/Models.
+                # - Otherwise (running from source), keep using the per-user VAICCS folder.
+                if sys.platform == 'darwin':
+                    if getattr(sys, 'frozen', False):
+                        chosen = exe_dir
+                    else:
+                        try:
+                            chosen = resources.get_vaiccs_root()
+                        except Exception:
+                            chosen = os.path.join(os.path.expanduser('~'), 'Documents', 'VAICCS')
                 else:
-                    chosen = exe_dir
-
+                    if script_dir and not _is_under_tmp(script_dir):
+                        chosen = script_dir
+                    elif exe_dir and not _is_under_tmp(exe_dir):
+                        chosen = exe_dir
+                    else:
+                        # Use a platform-appropriate per-user folder for persistent data
+                        try:
+                            if sys.platform.startswith('win'):
+                                local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+                            else:
+                                local = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+                        except Exception:
+                            local = None
+                        if local:
+                            chosen = os.path.join(local, 'VAICCS')
+                        else:
+                            chosen = exe_dir
             # Save the resolved application root path and models folder location.
-            # We prefer `script_dir` when running from source (e.g., in VS Code) so
-            # that models install next to the repository rather than under Python's
-            # interpreter installation directory (e.g. AppData/Local/Programs/Python).
+            # Use platform-specific naming for models folder on macOS (Documents/VAICCS/Models)
             self.app_root = os.path.abspath(chosen)
-            self.models_root = os.path.join(self.app_root, 'models')
+            models_dir_name = 'Models' if sys.platform == 'darwin' else 'models'
+            self.models_root = os.path.join(self.app_root, models_dir_name)
             os.makedirs(self.models_root, exist_ok=True)
             # Write startup log in models folder so packaged builds can report where the app writes models
             try:
@@ -704,16 +897,19 @@ class App(tk.Tk):
             try:
                 exe_app_root = os.path.dirname(os.path.abspath(sys.executable))
                 self.app_root = exe_app_root
-                self.models_root = os.path.join(exe_app_root, 'models')
+                models_dir_name = 'Models' if sys.platform == 'darwin' else 'models'
+                self.models_root = os.path.join(exe_app_root, models_dir_name)
             except Exception:
                 try:
                     script_app_root = os.path.abspath(os.path.dirname(__file__))
                     self.app_root = script_app_root
-                    self.models_root = os.path.join(script_app_root, 'models')
+                    models_dir_name = 'Models' if sys.platform == 'darwin' else 'models'
+                    self.models_root = os.path.join(script_app_root, models_dir_name)
                 except Exception:
                     # final fallback: use current working directory
                     self.app_root = os.path.abspath(os.getcwd())
-                    self.models_root = os.path.join(self.app_root, 'models')
+                    models_dir_name = 'Models' if sys.platform == 'darwin' else 'models'
+                    self.models_root = os.path.join(self.app_root, models_dir_name)
             try:
                 os.makedirs(self.models_root, exist_ok=True)
                 try:
@@ -872,7 +1068,7 @@ class App(tk.Tk):
 
         # connect
         if not port:
-            messagebox.showwarning("Serial", "Select a COM port first")
+            messagebox.showwarning("Serial", "Select a serial port first")
             self.serial_enabled_var.set(False)
             return
 
@@ -1097,8 +1293,27 @@ class App(tk.Tk):
             pass
 
     def _browse_model(self):
-        path = filedialog.askdirectory(title="Select VOSK model directory")
+        try:
+            start = self.model_path_var.get().strip() if getattr(self, 'model_path_var', None) is not None else ''
+        except Exception:
+            start = ''
+        if not start:
+            try:
+                start = self.models_root
+            except Exception:
+                start = ''
+        if not start:
+            try:
+                start = os.path.join(os.path.expanduser('~'), 'Documents')
+            except Exception:
+                start = ''
+
+        path = filedialog.askdirectory(title="Select VOSK model directory", initialdir=start if start else None)
         if path:
+            try:
+                path = os.path.abspath(os.path.expanduser(path))
+            except Exception:
+                pass
             self.model_path_var.set(path)
             self._update_model_status()
     # recase UI and helpers removed
@@ -1504,19 +1719,19 @@ class App(tk.Tk):
             assets = data.get('assets', []) or []
             asset_url = None
             asset_name = None
-            # Look specifically for the known installer filename first
-            desired_asset = 'VAICCS.install.AMD64.exe'
+            # Look specifically for the known Mac installer filename first
+            desired_asset = 'VAICCS.MacOS.AMD64.dmg'
             for a in assets:
                 name = a.get('name', '') or ''
                 if name == desired_asset:
                     asset_url = a.get('browser_download_url')
                     asset_name = name
                     break
-            # fallback: pick first common installer-like asset
+            # fallback: pick first common Mac installer-like asset
             if not asset_url:
                 for a in assets:
                     name = a.get('name', '') or ''
-                    if name.lower().endswith(('.exe', '.msi', '.zip')):
+                    if name.lower().endswith('.dmg'):
                         asset_url = a.get('browser_download_url')
                         asset_name = name
                         break
@@ -1561,6 +1776,13 @@ class App(tk.Tk):
                                             asset_url = a.get('browser_download_url')
                                             asset_name = name
                                             break
+                                    if not asset_url:
+                                        for a in assets:
+                                            name = a.get('name', '') or ''
+                                            if name.lower().endswith('.dmg'):
+                                                asset_url = a.get('browser_download_url')
+                                                asset_name = name
+                                                break
                                     if not asset_url:
                                         for a in assets:
                                             name = a.get('name', '') or ''
@@ -2066,7 +2288,16 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-            data = {"model_path": self.model_path_var.get().strip(), "cpu_threads": int(self.cpu_threads_var.get()),
+            try:
+                model_path = self.model_path_var.get().strip()
+            except Exception:
+                model_path = ''
+            try:
+                model_path = os.path.abspath(os.path.expanduser(model_path)) if model_path else ''
+            except Exception:
+                pass
+
+            data = {"model_path": model_path, "cpu_threads": int(self.cpu_threads_var.get()),
                     "serial_enabled": bool(self.serial_enabled_var.get()),
                     "serial_port": device_name,
                     "baud": int(self.baud_var.get()),
@@ -2125,58 +2356,25 @@ class App(tk.Tk):
                 data['punctuator_path'] = self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else ''
             except Exception:
                 data['punctuator_path'] = ''
-            # Convert file paths to relative when they sit under the project root
+            # Keep paths absolute in saved settings. Finder-launched apps can
+            # have a different working directory/environment, and relative
+            # paths are a common source of "works in Terminal, fails in .app".
             try:
-                base = os.path.abspath(os.path.dirname(__file__))
-                def _maybe_rel(p):
+                def _norm_abs(p: str) -> str:
                     if not p:
                         return ''
                     try:
-                        full = os.path.abspath(p)
-                        # normalize for case-insensitive filesystems
-                        base_n = os.path.normcase(base)
-                        full_n = os.path.normcase(full)
-                        if full_n == base_n or full_n.startswith(base_n + os.sep):
-                            return os.path.relpath(full, base).replace('\\', '/')
-                        return full
+                        p = os.path.expanduser(p)
+                    except Exception:
+                        pass
+                    try:
+                        return os.path.abspath(p)
                     except Exception:
                         return p
 
-                # apply to known path-like keys
-                # Convert file paths to relative when they sit under the project root
-                try:
-                    base = os.path.abspath(os.path.dirname(__file__))
-                    def _maybe_rel(p):
-                        if not p:
-                            return ''
-                        try:
-                            full = os.path.abspath(p)
-                            # normalize for case-insensitive filesystems
-                            base_n = os.path.normcase(base)
-                            full_n = os.path.normcase(full)
-                            if full_n == base_n or full_n.startswith(base_n + os.sep):
-                                return os.path.relpath(full, base).replace('\\', '/')
-                            return full
-                        except Exception:
-                            return p
-
-                    # apply to known path-like keys
-                    if 'model_path' in data:
-                        data['model_path'] = _maybe_rel(data.get('model_path', ''))
-                    # punctuator path
-                    if 'punctuator_path' in data:
-                        data['punctuator_path'] = _maybe_rel(data.get('punctuator_path', ''))
-                    # recase_path removed from settings
-                    if 'custom_vocab_data_dir' in data:
-                        data['custom_vocab_data_dir'] = _maybe_rel(data.get('custom_vocab_data_dir', ''))
-                    if 'bad_words' in data:
-                        data['bad_words'] = _maybe_rel(data.get('bad_words', ''))
-                except Exception:
-                    pass
-                if 'custom_vocab_data_dir' in data:
-                    data['custom_vocab_data_dir'] = _maybe_rel(data.get('custom_vocab_data_dir', ''))
-                if 'bad_words' in data:
-                    data['bad_words'] = _maybe_rel(data.get('bad_words', ''))
+                for k in ('model_path', 'punctuator_path', 'custom_vocab_data_dir', 'bad_words', 'auto_save_txt_path'):
+                    if k in data:
+                        data[k] = _norm_abs(data.get(k, ''))
             except Exception:
                 pass
             
@@ -2266,28 +2464,58 @@ class App(tk.Tk):
 
             # apply settings to UI (do not write to disk automatically)
             try:
-                # Resolve potentially relative paths saved against project root
-                base = os.path.abspath(os.path.dirname(__file__))
-                model = data.get("model_path")
-                if model:
+                # Resolve saved paths. Prefer:
+                # 1) absolute path as-is
+                # 2) relative to settings file directory
+                # 3) relative to app_root/models_root
+                settings_dir = os.path.abspath(os.path.dirname(path))
+
+                def _resolve_path(p: str) -> str:
+                    if not p:
+                        return ''
                     try:
-                        if not os.path.isabs(model):
-                            model = os.path.join(base, model)
-                        model = os.path.abspath(model)
+                        p = os.path.expanduser(p)
                     except Exception:
                         pass
-                    self.model_path_var.set(model)
-                    # optional punctuator path
-                    punc = data.get('punctuator_path')
-                    if punc:
+                    try:
+                        if os.path.isabs(p):
+                            return os.path.abspath(p)
+                    except Exception:
+                        pass
+
+                    candidates = []
+                    try:
+                        candidates.append(os.path.join(settings_dir, p))
+                    except Exception:
+                        pass
+                    try:
+                        candidates.append(os.path.join(self.app_root, p))
+                    except Exception:
+                        pass
+                    try:
+                        candidates.append(os.path.join(self.models_root, p))
+                    except Exception:
+                        pass
+                    for c in candidates:
                         try:
-                            if not os.path.isabs(punc):
-                                punc = os.path.join(base, punc)
-                            punc = os.path.abspath(punc)
+                            if c and os.path.exists(c):
+                                return os.path.abspath(c)
                         except Exception:
-                            pass
-                        self.punctuator_var.set(punc)
-                # recase path handling removed
+                            continue
+                    # fallback: just absolutize against settings dir
+                    try:
+                        return os.path.abspath(os.path.join(settings_dir, p))
+                    except Exception:
+                        return p
+
+                model = _resolve_path(data.get('model_path') or '')
+                if model:
+                    self.model_path_var.set(model)
+
+                punc = _resolve_path(data.get('punctuator_path') or '')
+                if punc and getattr(self, 'punctuator_var', None) is not None:
+                    self.punctuator_var.set(punc)
+
                 self.cpu_threads_var.set(int(data.get("cpu_threads", 0)))
                 self.serial_enabled_var.set(bool(data.get("serial_enabled", False)))
                 # profile matching settings (optional)
@@ -2386,11 +2614,9 @@ class App(tk.Tk):
                 bw_path = data.get("bad_words") or ''
                 if bw_path:
                     try:
-                        # resolve relative bad_words path
+                        # resolve saved path (may be absolute or relative)
                         try:
-                            if not os.path.isabs(bw_path):
-                                bw_path = os.path.join(base, bw_path)
-                            bw_path = os.path.abspath(bw_path)
+                            bw_path = _resolve_path(bw_path)
                         except Exception:
                             pass
                         loaded = mainmod.load_bad_words(bw_path)
@@ -2453,11 +2679,9 @@ class App(tk.Tk):
                             dd = data.get('custom_vocab_data_dir')
                             if dd:
                                 try:
-                                    # resolve relative custom data dir against project root
+                                    # resolve saved path (may be absolute or relative)
                                     try:
-                                        if not os.path.isabs(dd):
-                                            dd = os.path.join(base, dd)
-                                        dd = os.path.abspath(dd)
+                                        dd = _resolve_path(dd)
                                     except Exception:
                                         pass
                                     self.vocab_mgr.data_dir = str(dd)
@@ -2537,9 +2761,7 @@ class App(tk.Tk):
                     auto_save_path = data.get('auto_save_txt_path', '')
                     if auto_save_path:
                         try:
-                            if not os.path.isabs(auto_save_path):
-                                auto_save_path = os.path.join(base, auto_save_path)
-                            auto_save_path = os.path.abspath(auto_save_path)
+                            auto_save_path = _resolve_path(auto_save_path)
                         except Exception:
                             pass
                         self.auto_save_txt_path = auto_save_path
@@ -2789,7 +3011,16 @@ class App(tk.Tk):
             for name in color_order:
                 try:
                     bg, fg = self._serial_highlight_color_map.get(name, (name, 'black'))
-                    b = tk.Button(sw_frm, bg=bg, activebackground=bg, width=3, height=1, command=lambda n=name: _select_color(n))
+                    # Use a Label (frame-like) as a colored swatch; on macOS native buttons
+                    # often ignore background colors. Labels reliably show background color
+                    # across platforms and can be clicked.
+                    b = tk.Label(sw_frm, bg=bg, width=4, height=2, bd=1, relief='raised', cursor='hand2')
+                    def _on_click(event, n=name):
+                        _select_color(n)
+                    try:
+                        b.bind('<Button-1>', _on_click)
+                    except Exception:
+                        pass
                     b.pack(side=tk.LEFT, padx=(2,2))
                     sw_buttons[name] = b
                 except Exception:
@@ -3335,7 +3566,7 @@ class App(tk.Tk):
                 messagebox.showerror('Vosk Models', 'No download URL found')
                 return
             # confirm
-            if not messagebox.askyesno('Download', f"Download and install model '{name}' to application root? This may be large."):
+            if not messagebox.askyesno('Download', f"Download and install Vosk model '{name}' to application models directory? This may be large."):
                 return
 
             # Download into a temporary file under models_root
@@ -3350,10 +3581,24 @@ class App(tk.Tk):
                 except Exception:
                     pass
             except Exception:
-                # Not writeable -> try per-user LocalAppData path as a fallback
+                # Not writeable -> try a platform-appropriate per-user folder as a fallback
                 try:
-                    local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA') or os.path.expanduser('~')
-                    fallback = os.path.join(local, 'VAICCS', 'models')
+                    # Prefer the resources helper which on macOS returns ~/Documents/VAICCS/Models
+                    fallback = None
+                    try:
+                        fallback = resources.get_models_dir()
+                    except Exception:
+                        # last-resort: mimic previous fallback behavior
+                        try:
+                            if sys.platform.startswith('win'):
+                                local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA') or os.path.expanduser('~')
+                            elif sys.platform == 'darwin':
+                                local = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+                            else:
+                                local = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+                        except Exception:
+                            local = os.path.expanduser('~')
+                        fallback = os.path.join(local, 'VAICCS', 'models')
                     os.makedirs(fallback, exist_ok=True)
                     old_dest = dest_dir
                     dest_dir = fallback
@@ -3791,6 +4036,23 @@ class App(tk.Tk):
                 return
 
             dest_dir = self.models_root
+            # Ensure dest_dir is writeable; if not, prefer resources.get_models_dir()
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except Exception:
+                try:
+                    dest_dir = resources.get_models_dir()
+                    os.makedirs(dest_dir, exist_ok=True)
+                    try:
+                        self.models_root = dest_dir
+                        if getattr(self, '_models_root_var', None):
+                            self._models_root_var.set(dest_dir)
+                    except Exception:
+                        pass
+                except Exception:
+                    # fallback to original and let the download fail later
+                    pass
+
             fname = os.path.basename(url.split('?')[0])
             dest_path = os.path.join(dest_dir, fname)
 
@@ -4286,7 +4548,7 @@ class App(tk.Tk):
 
         # Create engine instance (heavy work happens in engine.start())
         self.engine = CaptionEngine(
-            model_path=model_path if not demo else None,
+            model_path=mainmod._resource_path(model_path) if not demo else None,
             demo=demo,
             cpu_threads=(cpu_threads if cpu_threads > 0 else None),
             enable_profile_matching=bool(self.profile_matching_var.get()),
@@ -4948,7 +5210,13 @@ class App(tk.Tk):
         canvas_frm = ttk.Frame(frm)
         canvas_frm.pack(fill=tk.BOTH, expand=True)
         
-        self.automations_canvas = tk.Canvas(canvas_frm, bg='white', highlightthickness=0)
+        # Use the ttk frame background so the canvas matches light/dark mode on macOS
+        try:
+            style = ttk.Style()
+            frame_bg = style.lookup('TFrame', 'background') or canvas_frm.cget('background')
+        except Exception:
+            frame_bg = canvas_frm.cget('background')
+        self.automations_canvas = tk.Canvas(canvas_frm, bg=frame_bg, highlightthickness=0)
         scrollbar = ttk.Scrollbar(canvas_frm, orient=tk.VERTICAL, command=self.automations_canvas.yview)
         self.automations_scrollable_frm = ttk.Frame(self.automations_canvas)
         
@@ -5012,11 +5280,16 @@ class App(tk.Tk):
         
         # If no automations, show placeholder
         if not self.automation_manager.get_automations():
-            placeholder = ttk.Label(self.automations_scrollable_frm, text="No shows configured. Click '+ Add Show' to get started.", foreground="gray")
+            # Avoid forcing a hardcoded foreground color so the label adapts to theme
+            placeholder = ttk.Label(self.automations_scrollable_frm, text="No shows configured. Click '+ Add Show' to get started.")
             placeholder.pack(fill=tk.X, padx=4, pady=4)
-        
-        # Update scrollbar visibility
-        self.automations_canvas.update_idletasks()
+            try:
+                # Ensure the scrollregion is updated and widgets are drawn immediately
+                self.automations_scrollable_frm.update_idletasks()
+                self.automations_canvas.configure(scrollregion=self.automations_canvas.bbox("all"))
+                self.automations_canvas.update_idletasks()
+            except Exception:
+                pass
 
     def _add_automation_entry_widget(self, automation: ShowAutomation | None = None, index: int | None = None):
         """Add a single automation entry widget to the display."""

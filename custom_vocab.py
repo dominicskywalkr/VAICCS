@@ -3,6 +3,8 @@ import os
 import shutil
 from typing import Dict, List
 from pathlib import Path
+import sys
+import resources
 
 
 class CustomVocabManager:
@@ -15,16 +17,28 @@ class CustomVocabManager:
     runtime.
     """
 
-    def __init__(self, path: str = "custom_vocab.json"):
+    def __init__(self, path: str = None):
         # Resolve path against project base (directory containing this script)
         _CV_BASE = os.path.abspath(os.path.dirname(__file__))
+        candidate = None
         try:
-            if path and not os.path.isabs(path):
-                candidate = os.path.join(_CV_BASE, path)
+            if path:
+                if not os.path.isabs(path):
+                    candidate = os.path.join(_CV_BASE, path)
+                else:
+                    candidate = path
             else:
-                candidate = path
+                # On macOS default to Documents/VAICCS/Custom words/custom_vocab.json
+                if sys.platform == 'darwin':
+                    try:
+                        cw = resources.get_custom_words_dir()
+                        candidate = os.path.join(cw, 'custom_vocab.json')
+                    except Exception:
+                        candidate = os.path.join(_CV_BASE, 'custom_vocab.json')
+                else:
+                    candidate = os.path.join(_CV_BASE, 'custom_vocab.json')
         except Exception:
-            candidate = path
+            candidate = path or os.path.join(_CV_BASE, 'custom_vocab.json')
         self.path = os.path.abspath(candidate) if candidate else os.path.abspath(os.path.join(_CV_BASE, 'custom_vocab.json'))
         # words -> pronunciation (may be empty string)
         self._entries: Dict[str, str] = {}
@@ -33,6 +47,19 @@ class CustomVocabManager:
             base = Path(self.path).resolve().parent
         except Exception:
             base = Path('.')
+        # For macOS, if using VAICCS custom words folder ensure data sits under it
+        try:
+            if sys.platform == 'darwin':
+                # if the selected path isn't already under the Documents VAICCS Custom words,
+                # prefer resources.get_custom_words_dir()
+                try:
+                    cw = resources.get_custom_words_dir()
+                    if not str(base).lower().startswith(str(cw).lower()):
+                        base = Path(cw)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.data_dir = str(base / 'custom_vocab_data')
         os.makedirs(self.data_dir, exist_ok=True)
         self._load()

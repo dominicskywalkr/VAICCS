@@ -11,7 +11,7 @@ from gui import App
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', required=True, help='COM port to connect (e.g. COM3)')
+    p.add_argument('--port', required=True, help='Serial port to connect (e.g. COM3 or /dev/tty.usbserial)')
     p.add_argument('--baud', type=int, default=9600)
     p.add_argument('--text', default='Hello world this is a live test')
     args = p.parse_args()

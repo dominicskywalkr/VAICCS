@@ -1,12 +1,16 @@
 """Loopback/test utility to verify serial TX and optional read-back.
 
 Usage:
-  python serial_loopback.py --port COM3 --baud 9600 --payload "Hello" --pulse-dtr --read
+    python serial_loopback.py --port <PORT> --baud 9600 --payload "Hello" --pulse-dtr --read
+
+Examples:
+    macOS/Linux: /dev/tty.usbserial or /dev/cu.usbserial
+    Windows: COM3
 
 Options:
-  --pulse-dtr   Pulse DTR for 200ms before sending (some devices need it)
-  --pulse-rts   Pulse RTS for 200ms before sending
-  --read        Attempt to read response after writing (useful for loopback)
+    --pulse-dtr   Pulse DTR for 200ms before sending (some devices need it)
+    --pulse-rts   Pulse RTS for 200ms before sending
+    --read        Attempt to read response after writing (useful for loopback)
 """
 import argparse
 import time

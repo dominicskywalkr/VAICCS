@@ -11,6 +11,25 @@ def _is_pyinstaller_bundle():
     return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
 
 
+def _get_platform_appdata_dir():
+    """Return a sensible per-user application data directory for the current platform.
+
+    - Windows: %APPDATA%
+    - macOS: ~/Library/Application Support
+    - Linux/other: $XDG_DATA_HOME or ~/.local/share
+    Returns None when no reasonable value could be determined.
+    """
+    try:
+        if sys.platform.startswith('win'):
+            return os.environ.get('APPDATA')
+        if sys.platform == 'darwin':
+            return os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+        # Linux / other Unix-like platforms
+        return os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+    except Exception:
+        return None
+
+
 def _get_writable_data_dir():
     """Get a writable directory for application data.
     
@@ -23,10 +42,11 @@ def _get_writable_data_dir():
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
             # PyInstaller bundle - use user's local app data or home directory
             try:
-                # Try APPDATA\VAICCS first (Windows)
-                appdata = os.environ.get('APPDATA')
-                if appdata:
-                    vaiccs_dir = os.path.join(appdata, 'VAICCS')
+                # Prefer platform-appropriate app data location (Windows APPDATA,
+                # macOS ~/Library/Application Support, Linux XDG_DATA_HOME)
+                platform_app = _get_platform_appdata_dir()
+                if platform_app:
+                    vaiccs_dir = os.path.join(platform_app, 'VAICCS')
                     os.makedirs(vaiccs_dir, exist_ok=True)
                     return vaiccs_dir
             except Exception:
@@ -138,9 +158,9 @@ def _candidate_paths():
     # (PyInstaller) build which writes into %APPDATA% even when current run
     # is the unpacked/dev version.
     try:
-        appdata = os.environ.get('APPDATA')
-        if appdata:
-            paths.insert(0, os.path.join(appdata, 'VAICCS', 'license.json'))
+        platform_app = _get_platform_appdata_dir()
+        if platform_app:
+            paths.insert(0, os.path.join(platform_app, 'VAICCS', 'license.json'))
     except Exception:
         pass
     
@@ -316,11 +336,11 @@ def save_license(data: Dict[str, str]) -> bool:
     except Exception:
         pass
 
-    # Also write to APPDATA/VAICCS if available (best-effort)
+    # Also write to a platform app-data 'VAICCS' folder if available (best-effort)
     try:
-        appdata = os.environ.get('APPDATA')
-        if appdata:
-            ap = os.path.join(appdata, 'VAICCS', 'license.json')
+        platform_app = _get_platform_appdata_dir()
+        if platform_app:
+            ap = os.path.join(platform_app, 'VAICCS', 'license.json')
             if os.path.abspath(ap) != os.path.abspath(_license_path()):
                 try:
                     ad = os.path.dirname(ap)
@@ -331,9 +351,9 @@ def save_license(data: Dict[str, str]) -> bool:
                         json.dump(out_data, af, indent=2)
                     try:
                         os.replace(tm, ap)
-                        _log_message(f"save_license: wrote APPDATA copy: {ap}")
+                        _log_message(f"save_license: wrote platform appdata copy: {ap}")
                     except Exception:
-                        _log_message(f"save_license: failed atomic replace for APPDATA copy: {ap}")
+                        _log_message(f"save_license: failed atomic replace for platform appdata copy: {ap}")
                         try:
                             if os.path.exists(ap):
                                 os.remove(ap)
@@ -341,11 +361,11 @@ def save_license(data: Dict[str, str]) -> bool:
                             pass
                         try:
                             os.replace(tm, ap)
-                            _log_message(f"save_license: fallback replace succeeded for APPDATA copy: {ap}")
+                            _log_message(f"save_license: fallback replace succeeded for platform appdata copy: {ap}")
                         except Exception:
-                            _log_message(f"save_license: fallback replace failed for APPDATA copy: {ap}")
+                            _log_message(f"save_license: fallback replace failed for platform appdata copy: {ap}")
                 except Exception:
-                    _log_message(f"save_license: exception while writing APPDATA copy: {ap}")
+                    _log_message(f"save_license: exception while writing platform appdata copy: {ap}")
     except Exception:
         pass
 

@@ -1,111 +1,69 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller spec for `launcher.py`.
 
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
-
-# Collect dynamic libs and submodules for vosk so native components are bundled
-vosk_binaries = collect_dynamic_libs('vosk') or []
-vosk_hidden = collect_submodules('vosk') or []
-
-# Conditionally include additional DLLs depending on the Windows release.
-# On Windows 7 include `api-ms-win-core-path-l1-1-0.dll` and the Python DLL.
-# On Windows 8 / 8.1 include only the Python DLL. When building the
-# executable the spec runs on the build host so we detect the host OS
-# and search common locations for the DLLs to add them to the bundle.
+Ensures the `vosk` Python package and its native library are bundled
+correctly using a dedicated hook (`hook-vosk.py`) and a runtime hook
+(`hooks/rth_vosk_fix.py`).
+"""
 import os
-import sys
+from PyInstaller.utils.hooks import collect_submodules
 
-extra_binaries = []
-if sys.platform == 'win32':
-    # Python DLL name for Python 3.x -> e.g. python313.dll for 3.13
-    py_dll_name = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+pathex = [os.path.abspath('.')]
 
-    # Candidate locations to search for DLLs
-    candidates = []
-    # Directory containing the running python executable
-    try:
-        exe_dir = os.path.dirname(sys.executable)
-        candidates.append(os.path.join(exe_dir, py_dll_name))
-    except Exception:
-        pass
-
-    # sys.base_prefix (installation root) and its possible DLL locations
-    for prefix in (getattr(sys, 'base_prefix', None), getattr(sys, 'exec_prefix', None)):
-        if prefix:
-            candidates.append(os.path.join(prefix, py_dll_name))
-            candidates.append(os.path.join(prefix, 'DLLs', py_dll_name))
-            candidates.append(os.path.join(prefix, 'libs', py_dll_name))
-
-    # System directories where the Python DLL might be located (32/64-bit)
-    system_root = os.environ.get('SystemRoot') or r'C:\Windows'
-
-    # Also add system32/python dll paths just in case
-    candidates.append(os.path.join(system_root, 'System32', py_dll_name))
-    candidates.append(os.path.join(system_root, 'SysWOW64', py_dll_name))
-
-    # Add python DLL if found
-    found_py = None
-    for p in candidates:
-        if p and os.path.isfile(p) and os.path.basename(p).lower() == py_dll_name.lower():
-            found_py = p
-            break
-    if found_py:
-        extra_binaries.append((found_py, '.'))
-
-    # No Windows 7-specific DLLs are included — only the Python DLL is collected.
-
-# Merge vosk binaries with any extra DLLs we found
-all_binaries = (vosk_binaries or []) + extra_binaries
-
-# data files: config and icon; we'll append all files under `media/` next
-datas = [
-    ('cryptolens_config.json', '.'),
-    ('icon.ico', '.'),
-]
-
-# Add everything under media/ (preserve folder structure inside the bundle)
-if os.path.isdir('media'):
-    for _root, _dirs, _files in os.walk('media'):
-        for _f in _files:
-            _src = os.path.join(_root, _f)
-            _dest = os.path.relpath(_root, '.')
-            datas.append((_src, _dest))
+# Use the dedicated Vosk hook (hook-vosk.py) to collect the Python package,
+# its extension module(s), and native libraries.
+binaries = []
+datas = []
 
 a = Analysis(
     ['launcher.py'],
-    pathex=[],
-    binaries=all_binaries,
+    pathex=pathex,
+    binaries=binaries,
     datas=datas,
-    hiddenimports=vosk_hidden,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
+    # Vosk is imported lazily in `main.py` (inside a method), which PyInstaller
+    # may not discover automatically. Include the package explicitly.
+    hiddenimports=['vosk'] + collect_submodules('vosk'),
+    hookspath=[os.path.abspath('.'), os.path.abspath('hooks')],
+    runtime_hooks=[os.path.join('hooks', 'rth_vosk_fix.py')],
     excludes=[],
-    noarchive=False,
-    optimize=0,
+    # Vosk's `open_dll()` uses `os.path.dirname(__file__)` to locate
+    # `libvosk.dyld`. Keeping pure-Python modules inside PYZ can yield a
+    # non-filesystem `__file__` that breaks this lookup when launched via Finder.
+    # `noarchive=True` materializes pure modules on disk inside the bundle.
+    noarchive=True,
 )
-pyz = PYZ(a.pure)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='VAICCS',
-    icon='icon.ico',
+    icon=None,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    # Exclude the Vosk native DLL from UPX compression to avoid
-    # runtime decompression failures ("decompression resulted in return code -1").
-    # You can add other native DLL names here if needed.
-    upx_exclude=['libvosk.dll'],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='VAICCS',
+)
+
+app = BUNDLE(
+    coll,
+    name='VAICCS.app',
+    icon=None,
+    bundle_identifier='com.dominic.vaiccs',
+    # No entitlements -> no app sandbox.
     entitlements_file=None,
 )

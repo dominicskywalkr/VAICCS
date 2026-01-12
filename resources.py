@@ -44,13 +44,75 @@ def _resource_path(relpath: str) -> str:
 
 
 def get_user_data_dir(app_name: str = "ClosedCaptioning") -> str:
-    base = os.getenv('APPDATA') or os.getenv('LOCALAPPDATA') or os.path.expanduser('~')
+    try:
+        if sys.platform.startswith('win'):
+            base = os.getenv('APPDATA') or os.getenv('LOCALAPPDATA') or os.path.expanduser('~')
+        elif sys.platform == 'darwin':
+            base = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support')
+        else:
+            base = os.getenv('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+    except Exception:
+        base = os.path.expanduser('~')
     path = os.path.join(base, app_name)
     try:
         os.makedirs(path, exist_ok=True)
     except Exception:
         pass
     return path
+
+
+def get_vaiccs_root() -> str:
+    """Return the platform-appropriate VAICCS root folder.
+
+    On macOS this is: ~/Documents/VAICCS
+    On Windows this will prefer %LOCALAPPDATA%/VAICCS or %APPDATA%/VAICCS
+    On Linux use XDG or ~/.local/share/VAICCS
+    """
+    try:
+        if sys.platform.startswith('win'):
+            base = os.getenv('LOCALAPPDATA') or os.getenv('APPDATA') or os.path.expanduser('~')
+        elif sys.platform == 'darwin':
+            base = os.path.join(os.path.expanduser('~'), 'Documents')
+        else:
+            base = os.getenv('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+    except Exception:
+        base = os.path.expanduser('~')
+    path = os.path.join(base, 'VAICCS')
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def get_models_dir() -> str:
+    root = get_vaiccs_root()
+    d = os.path.join(root, 'Models')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def get_voice_profiles_dir() -> str:
+    root = get_vaiccs_root()
+    d = os.path.join(root, 'Voice profiles')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def get_custom_words_dir() -> str:
+    root = get_vaiccs_root()
+    d = os.path.join(root, 'Custom words')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
 
 
 def ensure_user_resource(relpath: str) -> str:

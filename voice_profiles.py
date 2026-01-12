@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import sys
+import resources
 from datetime import datetime
 from pathlib import Path
 import shutil
@@ -76,8 +78,20 @@ class VoiceProfileManager:
 
     INDEX_NAME = "index.json"
 
-    def __init__(self, profiles_dir: str = "voice_profiles", sample_rate: int = 16000, n_mfcc: int = 20):
-        self.profiles_dir = Path(profiles_dir)
+    def __init__(self, profiles_dir: str = None, sample_rate: int = 16000, n_mfcc: int = 20):
+        # Default to Documents/VAICCS/Voice profiles on macOS, otherwise local folder
+        if profiles_dir:
+            pd = profiles_dir
+        else:
+            try:
+                if sys.platform == 'darwin':
+                    pd = resources.get_voice_profiles_dir()
+                else:
+                    pd = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'voice_profiles')
+            except Exception:
+                pd = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'voice_profiles')
+
+        self.profiles_dir = Path(pd)
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self.sample_rate = sample_rate
         self.n_mfcc = n_mfcc

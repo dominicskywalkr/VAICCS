@@ -47,7 +47,7 @@ def choose_port_interactive(ports):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--port', help='COM port (e.g. COM3)')
+    ap.add_argument('--port', help='Serial port (e.g. COM3 or /dev/tty.usbserial)')
     ap.add_argument('--baud', type=int, default=9600)
     ap.add_argument('--text', default='TEST: Hello from serial_test.py')
     ap.add_argument('--pulse-dtr', action='store_true', help='Pulse DTR for 200ms before sending')
