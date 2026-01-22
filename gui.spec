@@ -67,3 +67,51 @@ app = BUNDLE(
     # No entitlements -> no app sandbox.
     entitlements_file=None,
 )
+
+
+# Debug bundle: double-clicking this app opens Terminal and tails a log file.
+debug_a = Analysis(
+    ['launcher_debug.py'],
+    pathex=pathex,
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=['vosk'] + collect_submodules('vosk'),
+    hookspath=[os.path.abspath('.'), os.path.abspath('hooks')],
+    runtime_hooks=[os.path.join('hooks', 'rth_vosk_fix.py')],
+    excludes=[],
+    noarchive=True,
+)
+
+debug_pyz = PYZ(debug_a.pure, debug_a.zipped_data, cipher=None)
+
+debug_exe = EXE(
+    debug_pyz,
+    debug_a.scripts,
+    [],
+    exclude_binaries=True,
+    name='VAICCS Debug',
+    icon=None,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
+
+debug_coll = COLLECT(
+    debug_exe,
+    debug_a.binaries,
+    debug_a.zipfiles,
+    debug_a.datas,
+    strip=False,
+    upx=False,
+    name='VAICCS Debug',
+)
+
+debug_app = BUNDLE(
+    debug_coll,
+    name='VAICCS Debug.app',
+    icon=None,
+    bundle_identifier='com.dominic.vaiccs.debug',
+    entitlements_file=None,
+)

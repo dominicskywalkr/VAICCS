@@ -6,6 +6,7 @@ import json
 import datetime
 import re
 import threading
+import logging
 from typing import Callable, Optional, List
 import tempfile
 import wave
@@ -28,6 +29,43 @@ __version__ = "1.0b4"
 # Configuration
 DEFAULT_MODEL_PATH = "model"
 SAMPLE_RATE = 16000
+
+# --- Audio tap (for UI visualizations) ---
+# Keep a rolling window of the most recent mono int16 audio bytes produced by
+# the sounddevice callback. This allows the GUI to render a spectrum (or other
+# meters) without consuming the recognizer queue.
+_AUDIO_TAP_LOCK = threading.Lock()
+_AUDIO_TAP_MAX_BYTES = SAMPLE_RATE * 2  # 1 second of mono int16
+_AUDIO_TAP_BUFFER = bytearray()
+
+
+def get_recent_audio_tap_bytes(max_bytes: Optional[int] = None) -> bytes:
+    """Return a copy of the most recent audio bytes (mono int16).
+
+    Non-destructive: does not read from the recognizer queue.
+    """
+    if max_bytes is None:
+        max_bytes = _AUDIO_TAP_MAX_BYTES
+    try:
+        max_bytes = int(max_bytes)
+    except Exception:
+        max_bytes = _AUDIO_TAP_MAX_BYTES
+    if max_bytes <= 0:
+        return b""
+
+    with _AUDIO_TAP_LOCK:
+        if not _AUDIO_TAP_BUFFER:
+            return b""
+        return bytes(_AUDIO_TAP_BUFFER[-max_bytes:])
+
+
+def _audio_tap_write(mono_int16_bytes: bytes) -> None:
+    if not mono_int16_bytes:
+        return
+    with _AUDIO_TAP_LOCK:
+        _AUDIO_TAP_BUFFER.extend(mono_int16_bytes)
+        if len(_AUDIO_TAP_BUFFER) > _AUDIO_TAP_MAX_BYTES:
+            del _AUDIO_TAP_BUFFER[:-_AUDIO_TAP_MAX_BYTES]
 
 
 def _resource_path(relpath: str) -> str:
@@ -215,7 +253,14 @@ def callback(indata, frames, time, status):
     Downmix to mono when numpy is available; otherwise pass raw bytes through.
     """
     if status:
-        print(status, file=sys.stderr)
+        try:
+            logging.getLogger("vaiccs.audio").warning("Audio callback status: %s", status)
+        except Exception:
+            # last resort
+            try:
+                print(status, file=sys.stderr)
+            except Exception:
+                pass
 
     # If numpy is available and indata is an ndarray, downmix to mono and queue bytes
     if np is not None and isinstance(indata, np.ndarray):
@@ -224,14 +269,18 @@ def callback(indata, frames, time, status):
                 mono = indata.mean(axis=1).astype('int16')
             else:
                 mono = indata.reshape(-1).astype('int16')
-            q.put(mono.tobytes())
+            b = mono.tobytes()
+            _audio_tap_write(b)
+            q.put(b)
             return
         except Exception:
             pass
 
     # Fallback for RawInputStream or unexpected types: push raw bytes
     try:
-        q.put(bytes(indata))
+        b = bytes(indata)
+        _audio_tap_write(b)
+        q.put(b)
     except Exception:
         # Last-resort: ignore this chunk
         return
@@ -320,6 +369,22 @@ class CaptionEngine:
                 self._punctuator_init_error = str(e)
 
     def _init_recognizer(self):
+        logger = logging.getLogger("vaiccs")
+        try:
+            logger.info(
+                "Recognizer init: frozen=%s platform=%s meipass=%s",
+                getattr(sys, "frozen", False),
+                sys.platform,
+                getattr(sys, "_MEIPASS", None),
+            )
+            logger.info("Recognizer init: model_path=%s", getattr(self, "model_path", None))
+            try:
+                logger.info("Recognizer init: sys.path[0:6]=%s", sys.path[:6])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # Determine whether to use recognizer
         # If cpu_threads specified, set environment variables before importing Vosk/Kaldi
         if self.cpu_threads:
@@ -333,12 +398,26 @@ class CaptionEngine:
                 pass
 
         if self.demo:
+            try:
+                logger.info("Recognizer init: demo=True (skipping Vosk)")
+            except Exception:
+                pass
             self._model = None
             self._recognizer = None
             return
         # Delay import of vosk until after we set thread env vars
         try:
             from vosk import Model, KaldiRecognizer
+            try:
+                import vosk as _vosk
+                logger.info("Vosk import OK: %s", getattr(_vosk, "__file__", None))
+                try:
+                    lib_guess = os.path.join(os.path.dirname(_vosk.__file__), "libvosk.dyld")
+                    logger.info("Vosk expected libvosk.dyld: %s (exists=%s)", lib_guess, os.path.exists(lib_guess))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception as e:
             # Attempt to record the full traceback so frozen executables can surface
             # the underlying import error (missing DLLs, incompatible wheels, etc.).
@@ -347,6 +426,11 @@ class CaptionEngine:
                 tb = traceback.format_exc()
             except Exception:
                 tb = str(e)
+            try:
+                logger.error("Vosk import FAILED")
+                logger.error(tb)
+            except Exception:
+                pass
             # Try writing the traceback to several accessible locations so
             # users running a frozen exe can find the cause more easily.
             tried_paths = []
@@ -389,12 +473,20 @@ class CaptionEngine:
 
         if Model is None or KaldiRecognizer is None:
             # Vosk not available; fall back to demo
+            try:
+                logger.info("Recognizer init: falling back to demo (vosk unavailable)")
+            except Exception:
+                pass
             self._recognizer = None
             self._model = None
             self.demo = True
             return
 
         if not os.path.exists(self.model_path):
+            try:
+                logger.info("Recognizer init: model path does not exist -> demo (%s)", self.model_path)
+            except Exception:
+                pass
             self._recognizer = None
             self._model = None
             self.demo = True
@@ -430,6 +522,10 @@ class CaptionEngine:
                         model_dir = self.model_path
 
             self._model = Model(model_dir)
+            try:
+                logger.info("Vosk Model created OK (%s)", model_dir)
+            except Exception:
+                pass
             # If a runtime vocabulary was configured, pass it as grammar to KaldiRecognizer
             try:
                 if self._current_vocab:
@@ -442,10 +538,20 @@ class CaptionEngine:
                 # fallback to simple recognizer creation
                 self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
             try:
+                logger.info("KaldiRecognizer created OK")
+            except Exception:
+                pass
+            try:
                 self._recognizer.SetWords(True)
             except Exception:
                 pass
         except Exception:
+            try:
+                import traceback
+                logger.error("Recognizer init failed; falling back to demo")
+                logger.error(traceback.format_exc())
+            except Exception:
+                pass
             self._recognizer = None
             self._model = None
             self.demo = True
@@ -502,6 +608,16 @@ class CaptionEngine:
     def start(self, callback: Callable[[str], None]):
         if self._thread and self._thread.is_alive():
             return
+        try:
+            logging.getLogger("vaiccs.engine").info(
+                "Engine start: source=%s demo=%s model_path=%s sd.default.device=%r",
+                getattr(self, 'source', None),
+                getattr(self, 'demo', None),
+                getattr(self, 'model_path', None),
+                getattr(sd, 'default', None).device if hasattr(sd, 'default') else None,
+            )
+        except Exception:
+            pass
         _ensure_bad_words()
         self._callback = callback
         self._stop_event.clear()
@@ -533,6 +649,7 @@ class CaptionEngine:
             pass
 
     def _run_loop(self):
+        logger = logging.getLogger("vaiccs.audio")
         # Safely drain any pending items from the queue without touching internals
         try:
             while True:
@@ -554,19 +671,45 @@ class CaptionEngine:
                 pass
 
         try:
+            try:
+                logger.info(
+                    "Audio open attempt: use_raw=%s source=%s samplerate=%s blocksize=%s dtype=%s channels=%s extra_settings=%s device=%r",
+                    use_raw,
+                    getattr(self, 'source', None),
+                    stream_kwargs.get('samplerate'),
+                    stream_kwargs.get('blocksize'),
+                    stream_kwargs.get('dtype'),
+                    stream_kwargs.get('channels'),
+                    'extra_settings' in stream_kwargs,
+                    getattr(sd, 'default', None).device if hasattr(sd, 'default') else None,
+                )
+            except Exception:
+                pass
             if use_raw:
                 stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16', channels=stream_kwargs.get('channels', 1), callback=callback, **({'extra_settings': stream_kwargs['extra_settings']} if 'extra_settings' in stream_kwargs else {}))
             else:
                 stream = sd.InputStream(**stream_kwargs)
 
             with stream:
+                try:
+                    logger.info("Audio stream opened OK (%s)", type(stream).__name__)
+                except Exception:
+                    pass
                 start_time = datetime.datetime.now()
                 caption_index = 1
+                got_audio = False
+                processing_errors = 0
                 while not self._stop_event.is_set():
                     try:
                         data = q.get(timeout=0.5)
                     except Exception:
                         continue
+                    if not got_audio:
+                        got_audio = True
+                        try:
+                            logger.info("Audio callback is producing data (first chunk: %d bytes)", len(data) if data is not None else -1)
+                        except Exception:
+                            pass
                     # snapshot recognizer under lock to avoid races while it's replaced
                     with self._rec_lock:
                         local_rec = self._recognizer
@@ -650,6 +793,12 @@ class CaptionEngine:
                                         self._callback(out)
                                     caption_index += 1
                         except Exception:
+                            processing_errors += 1
+                            if processing_errors <= 3 or processing_errors % 250 == 0:
+                                try:
+                                    logger.exception("Recognizer processing error (count=%d)", processing_errors)
+                                except Exception:
+                                    pass
                             continue
                     else:
                         now = datetime.datetime.now()
@@ -660,6 +809,10 @@ class CaptionEngine:
                         caption_index += 1
         except Exception as e:
             # stream could not be opened; call callback with an error message
+            try:
+                logger.exception("Could not open audio device")
+            except Exception:
+                pass
             if self._callback:
                 self._callback(f"[ERROR] Could not open audio device: {e}")
 

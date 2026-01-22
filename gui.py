@@ -53,9 +53,271 @@ except Exception:
 from gui_splash import Splash
 
 
+class AudioSpectrumVisualizer(tk.Canvas):
+    def __init__(
+        self,
+        parent,
+        *,
+        bar_count: int = 32,
+        fft_size: int = 1024,
+        update_ms: int = 50,
+        min_hz: float = 60.0,
+        max_hz: float = 8000.0,
+        height: int = 64,
+        **kwargs,
+    ):
+        kwargs.setdefault('bg', '#0b0b0b')
+        kwargs.setdefault('highlightthickness', 1)
+        kwargs.setdefault('highlightbackground', '#2a2a2a')
+        super().__init__(parent, height=height, **kwargs)
+
+        self._bar_count = max(8, int(bar_count))
+        self._fft_size = int(fft_size)
+        if self._fft_size < 256:
+            self._fft_size = 256
+        if (self._fft_size & (self._fft_size - 1)) != 0:
+            # force power of two for speed
+            p = 1
+            while p < self._fft_size:
+                p <<= 1
+            self._fft_size = p
+
+        self._update_ms = max(16, int(update_ms))
+        self._min_hz = float(min_hz)
+        self._max_hz = float(max_hz)
+
+        self._running = False
+        self._after_id = None
+        self._rects = []
+        self._smoothed = [0.0] * self._bar_count
+        self._bands = None
+
+        try:
+            self.bind('<Configure>', lambda e: self._ensure_rects())
+        except Exception:
+            pass
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        try:
+            if self._after_id is not None:
+                self.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+
+    def _ensure_bands(self, sr: int):
+        try:
+            import numpy as np
+        except Exception:
+            self._bands = None
+            return
+
+        sr = int(sr) if sr else 16000
+        max_hz = min(float(self._max_hz), sr / 2.0)
+        min_hz = max(1.0, float(self._min_hz))
+        if max_hz <= min_hz:
+            max_hz = min_hz + 1.0
+
+        freqs = np.geomspace(min_hz, max_hz, num=self._bar_count + 1)
+        bin_freq = sr / float(self._fft_size)
+        bands = []
+        for i in range(self._bar_count):
+            start_bin = int(freqs[i] / bin_freq)
+            end_bin = int(freqs[i + 1] / bin_freq)
+            start_bin = max(1, start_bin)  # skip DC
+            end_bin = max(start_bin + 1, end_bin)
+            # rfft has (fft_size/2 + 1) bins
+            end_bin = min(end_bin, (self._fft_size // 2) + 1)
+            bands.append((start_bin, end_bin))
+        self._bands = bands
+
+    def _ensure_rects(self):
+        try:
+            w = int(self.winfo_width())
+            h = int(self.winfo_height())
+        except Exception:
+            return
+        if w <= 4 or h <= 4:
+            return
+
+        if len(self._rects) == self._bar_count:
+            return
+
+        try:
+            self.delete('all')
+        except Exception:
+            pass
+        self._rects = []
+
+        gap = 2
+        bar_w = max(1, (w - (self._bar_count - 1) * gap) // self._bar_count)
+        x = 0
+        for _ in range(self._bar_count):
+            rid = self.create_rectangle(x, h - 2, x + bar_w, h - 2, fill='#00c853', width=0)
+            self._rects.append(rid)
+            x += bar_w + gap
+
+    def _draw_message(self, msg: str):
+        try:
+            self.delete('all')
+        except Exception:
+            pass
+        try:
+            self.create_text(6, 6, anchor='nw', fill='#bdbdbd', text=msg)
+        except Exception:
+            pass
+
+    def _tick(self):
+        if not self._running:
+            return
+        try:
+            if not self.winfo_exists():
+                self._running = False
+                return
+        except Exception:
+            pass
+
+        try:
+            self._render()
+        except Exception:
+            # never let the UI crash from visualization
+            pass
+
+        try:
+            self._after_id = self.after(self._update_ms, self._tick)
+        except Exception:
+            self._after_id = None
+
+    def _render(self):
+        try:
+            import numpy as np
+        except Exception:
+            self._draw_message('Spectrum: numpy missing')
+            return
+
+        # Pull recent audio without consuming recognition queue.
+        try:
+            sr = int(getattr(mainmod, 'SAMPLE_RATE', 16000))
+        except Exception:
+            sr = 16000
+
+        try:
+            get_bytes = getattr(mainmod, 'get_recent_audio_tap_bytes', None)
+            if get_bytes is None:
+                self._draw_message('Spectrum: tap unavailable')
+                return
+            b = get_bytes(self._fft_size * 2)
+        except Exception:
+            b = b''
+
+        if not b or len(b) < 256:
+            self._ensure_rects()
+            self._update_bars([0.0] * self._bar_count)
+            return
+
+        x = np.frombuffer(b, dtype=np.int16).astype(np.float32)
+        if x.size < self._fft_size:
+            pad = np.zeros((self._fft_size - x.size,), dtype=np.float32)
+            x = np.concatenate([pad, x])
+        elif x.size > self._fft_size:
+            x = x[-self._fft_size:]
+
+        x = x / 32768.0
+        win = np.hanning(self._fft_size).astype(np.float32)
+        spec = np.abs(np.fft.rfft(x * win)).astype(np.float32)
+
+        if spec.size <= 2:
+            self._ensure_rects()
+            self._update_bars([0.0] * self._bar_count)
+            return
+
+        # normalize per-frame to make it usable across mic gain levels
+        denom = float(spec.max())
+        if denom <= 1e-9:
+            spec = spec * 0.0
+        else:
+            spec = spec / denom
+
+        if self._bands is None:
+            self._ensure_bands(sr)
+        if self._bands is None:
+            self._ensure_rects()
+            self._update_bars([0.0] * self._bar_count)
+            return
+
+        vals = []
+        for (s, e) in self._bands:
+            if e <= s or s >= spec.size:
+                vals.append(0.0)
+                continue
+            e = min(e, int(spec.size))
+            band = float(spec[s:e].mean())
+            # perceptual-ish response: sqrt
+            v = band ** 0.5
+            vals.append(v)
+
+        self._ensure_rects()
+        self._update_bars(vals)
+
+    def _update_bars(self, vals):
+        try:
+            w = int(self.winfo_width())
+            h = int(self.winfo_height())
+        except Exception:
+            return
+        if h <= 6:
+            return
+
+        # smooth a bit to reduce flicker
+        alpha = 0.35
+        for i in range(min(self._bar_count, len(vals))):
+            try:
+                v = float(vals[i])
+            except Exception:
+                v = 0.0
+            if v < 0.0:
+                v = 0.0
+            if v > 1.0:
+                v = 1.0
+            self._smoothed[i] = (1.0 - alpha) * self._smoothed[i] + alpha * v
+
+        gap = 2
+        bar_w = max(1, (w - (self._bar_count - 1) * gap) // self._bar_count)
+        x0 = 0
+        for i, rid in enumerate(self._rects[:self._bar_count]):
+            v = self._smoothed[i]
+            top = int((h - 4) * (1.0 - v)) + 2
+            if top < 2:
+                top = 2
+            if top > h - 2:
+                top = h - 2
+            x1 = x0 + bar_w
+            # simple green->yellow->red ramp
+            if v < 0.6:
+                fill = '#00c853'
+            elif v < 0.85:
+                fill = '#ffd600'
+            else:
+                fill = '#ff1744'
+            try:
+                self.coords(rid, x0, top, x1, h - 2)
+                self.itemconfig(rid, fill=fill)
+            except Exception:
+                pass
+            x0 = x1 + gap
+
+
 class App(tk.Tk):
     def __init__(self, simulate_automation: bool = False):
         super().__init__()
+        self._mic_permission_probe_started = False
         try:
             self._splash = Splash(self, title_text="VAICCS (Beta)", creator="Dominic Natoli")
             self._splash.update_status("Starting...")
@@ -729,7 +991,15 @@ class App(tk.Tk):
         self.save_txt_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
         
 
-        ttk.Label(right, text="Audio Input:").pack(pady=(20, 6), padx=8, anchor=tk.W)
+        # Audio spectrum (visual aid) - sits above the Audio Input dropdown.
+        try:
+            self.spectrum_viz_main = AudioSpectrumVisualizer(right, height=64)
+            self.spectrum_viz_main.pack(padx=8, pady=(10, 6), fill=tk.X)
+            self.spectrum_viz_main.start()
+        except Exception:
+            self.spectrum_viz_main = None
+
+        ttk.Label(right, text="Audio Input:").pack(pady=(6, 6), padx=8, anchor=tk.W)
         self.device_var = tk.StringVar()
         self.device_combo = ttk.Combobox(right, textvariable=self.device_var, state="readonly")
         self.device_combo.pack(padx=8, fill=tk.X)
@@ -937,6 +1207,82 @@ class App(tk.Tk):
                 self.deiconify()
             except Exception:
                 pass
+        except Exception:
+            pass
+
+        # On macOS, proactively trigger the microphone permission prompt by
+        # briefly opening an input stream at launch.
+        try:
+            self.after(250, self._request_microphone_permission)
+        except Exception:
+            try:
+                self.safe_after(250, self._request_microphone_permission)
+            except Exception:
+                pass
+
+    def _request_microphone_permission(self):
+        """Best-effort macOS mic permission prompt.
+
+        macOS only shows the prompt after the app actually attempts to access
+        the microphone, and only if the bundle Info.plist contains
+        NSMicrophoneUsageDescription.
+        """
+        try:
+            if sys.platform != 'darwin':
+                return
+        except Exception:
+            return
+
+        # Run once per app start.
+        try:
+            if getattr(self, '_mic_permission_probe_started', False):
+                return
+            self._mic_permission_probe_started = True
+        except Exception:
+            pass
+
+        def _probe():
+            try:
+                # Respect current UI selection if one is set.
+                try:
+                    sel = self.device_combo.get() if getattr(self, 'device_combo', None) is not None else ''
+                    if sel and ':' in sel:
+                        idx = int(sel.split(':', 1)[0])
+                        try:
+                            sd.default.device = idx
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Open a tiny stream; this is what triggers the OS permission prompt.
+                def _cb(indata, frames, time_info, status):
+                    return
+
+                try:
+                    with sd.InputStream(samplerate=16000, channels=1, dtype='int16', callback=_cb):
+                        time.sleep(0.25)
+                except Exception as e:
+                    msg = str(e)
+                    # If permission was denied, guide the user to Settings.
+                    if any(k in msg.lower() for k in ('not authorized', 'permission', 'denied', 'tcc')):
+                        try:
+                            self.safe_after(
+                                0,
+                                lambda: messagebox.showwarning(
+                                    "Microphone Permission",
+                                    "VAICCS could not access the microphone.\n\n"
+                                    "Go to System Settings → Privacy & Security → Microphone and enable VAICCS, then restart the app.",
+                                ),
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                # Never block startup for this.
+                return
+
+        try:
+            threading.Thread(target=_probe, daemon=True).start()
         except Exception:
             pass
 
@@ -4904,6 +5250,7 @@ class App(tk.Tk):
 
         # recording controls below
         ttk.Separator(right, orient='horizontal').pack(fill=tk.X, pady=(8,8))
+
         ttk.Label(right, text="Audio Controls:").pack(anchor=tk.W)
         audio_btns = ttk.Frame(right)
         audio_btns.pack(fill=tk.X, pady=(4,4))
