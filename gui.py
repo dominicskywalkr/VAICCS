@@ -17,6 +17,7 @@ import subprocess
 import datetime
 import time
 import re
+from collections import deque
 from urllib.parse import quote, urlparse
 from main import CaptionEngine
 import main as mainmod
@@ -51,6 +52,314 @@ except Exception:
     SerialManager = None
 from gui_splash import Splash
 
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+
+class AudioFrequencyVisualizer(ttk.Frame):
+    def __init__(self, parent, *, height: int = 44, bars: int = 32, update_ms: int = 33):
+        super().__init__(parent)
+        self._height = int(height)
+        self._bars = int(bars)
+        self._update_ms = int(update_ms)
+
+        self._lock = threading.Lock()
+        self._latest = None  # np.ndarray int16 (unused once queue/ring active; kept for safety)
+        self._queue = deque(maxlen=4096)  # float32 mono samples in [-1,1] (hop-sized chunks)
+        self._sr = 16000
+        self._last_audio_t = 0.0
+        self._ema = None
+        self._nfft = 2048
+        self._hop = 128  # 16kHz -> 8ms per hop (more responsive)
+        self._ring = None
+        self._window = None
+        self._latest_norm = None
+        self._worker_thread = None
+        self._worker_stop = None
+        self._after_id = None
+        self._running = False
+
+        self.canvas = tk.Canvas(self, height=self._height, highlightthickness=0, bg="black")
+        self.canvas.pack(fill=tk.X, expand=True)
+        self.canvas.bind("<Configure>", lambda e: self._rebuild())
+
+        self._rects = []
+        self._rebuild()
+
+        if np is not None:
+            try:
+                self._ring = np.zeros(self._nfft, dtype=np.float32)
+                self._window = np.hanning(self._nfft).astype(np.float32)
+            except Exception:
+                self._ring = None
+                self._window = None
+
+    def on_audio(self, mono_int16, samplerate: int):
+        if np is None:
+            return
+        try:
+            # called from sounddevice callback thread; keep it tiny
+            arr = mono_int16
+            if not isinstance(arr, np.ndarray):
+                return
+            if arr.dtype != np.int16:
+                arr = arr.astype(np.int16, copy=False)
+
+            # Convert to float32 [-1, 1] and split into hop-sized chunks
+            f = arr.astype(np.float32) * (1.0 / 32768.0)
+            with self._lock:
+                self._latest = arr  # keep last raw chunk for fallback
+                self._sr = int(samplerate) if samplerate else 16000
+                try:
+                    for i in range(0, f.size, self._hop):
+                        chunk = f[i:i + self._hop]
+                        if chunk.size == self._hop:
+                            self._queue.append(chunk.copy())
+                except Exception:
+                    pass
+                try:
+                    self._last_audio_t = time.monotonic()
+                except Exception:
+                    self._last_audio_t = 0.0
+        except Exception:
+            return
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        # Start worker thread for FFT processing
+        try:
+            if self._worker_stop is None:
+                self._worker_stop = threading.Event()
+            else:
+                self._worker_stop.clear()
+            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker_thread.start()
+        except Exception:
+            pass
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        try:
+            if self._worker_stop is not None:
+                self._worker_stop.set()
+        except Exception:
+            pass
+        try:
+            if self._after_id is not None:
+                self.after_cancel(self._after_id)
+        except Exception:
+            pass
+        self._after_id = None
+        # clear bars
+        try:
+            w = max(1, self.canvas.winfo_width())
+            h = max(1, self.canvas.winfo_height())
+            for i, rid in enumerate(self._rects):
+                x0 = int(i * w / max(1, self._bars))
+                x1 = int((i + 1) * w / max(1, self._bars))
+                self.canvas.coords(rid, x0, h, x1, h)
+        except Exception:
+            pass
+
+    def _worker_loop(self):
+        # Compute spectrum in background; UI thread only draws.
+        try:
+            interval = max(0.008, float(self._update_ms) / 1000.0)
+        except Exception:
+            interval = 0.016
+
+        last_tick = None
+        while True:
+            try:
+                if self._worker_stop is not None and self._worker_stop.is_set():
+                    return
+            except Exception:
+                return
+
+            try:
+                now = time.monotonic()
+            except Exception:
+                now = 0.0
+
+            if last_tick is None:
+                last_tick = now
+
+            # Pace consumption based on elapsed time so bursty audio doesn't drain instantly
+            dt = 0.0
+            try:
+                dt = max(0.0, (now - last_tick))
+            except Exception:
+                dt = 0.0
+            last_tick = now
+
+            try:
+                with self._lock:
+                    sr = int(self._sr) if self._sr else 16000
+                    last_audio_t = float(self._last_audio_t or 0.0)
+            except Exception:
+                sr = 16000
+                last_audio_t = 0.0
+
+            # How many samples should advance this tick?
+            samples_need = int(sr * dt)
+            if samples_need <= 0:
+                samples_need = int(sr * interval)
+
+            # Convert need to hops
+            hops_need = max(1, int(round(samples_need / float(max(1, self._hop)))))
+
+            chunks = []
+            try:
+                with self._lock:
+                    for _ in range(hops_need):
+                        if not self._queue:
+                            break
+                        chunks.append(self._queue.popleft())
+            except Exception:
+                chunks = []
+
+            # Determine staleness
+            stale = False
+            try:
+                stale = (now and last_audio_t and (now - last_audio_t) > 0.75)
+            except Exception:
+                stale = False
+
+            if np is None or self._ring is None or self._window is None:
+                # sleep and continue
+                try:
+                    time.sleep(interval)
+                except Exception:
+                    pass
+                continue
+
+            updated = False
+            try:
+                for c in chunks:
+                    n = int(c.size)
+                    if n <= 0:
+                        continue
+                    if n >= self._nfft:
+                        self._ring[:] = c[-self._nfft:]
+                    else:
+                        self._ring[:-n] = self._ring[n:]
+                        self._ring[-n:] = c
+                    updated = True
+            except Exception:
+                updated = False
+
+            if updated:
+                try:
+                    xw = self._ring * self._window
+                    spec = np.abs(np.fft.rfft(xw)) / (self._nfft / 2.0)
+
+                    fmin = 80.0
+                    fmax = min(8000.0, float(sr) / 2.0)
+                    edges = np.geomspace(fmin, fmax, num=self._bars + 1)
+                    hz_per_bin = float(sr) / float(self._nfft)
+                    band_db = np.zeros(self._bars, dtype=np.float32)
+                    for i in range(self._bars):
+                        b0 = int(edges[i] / hz_per_bin)
+                        b1 = int(edges[i + 1] / hz_per_bin)
+                        b0 = max(1, min(b0, spec.size - 1))
+                        b1 = max(b0 + 1, min(b1, spec.size))
+                        s = spec[b0:b1]
+                        rms = float(np.sqrt(np.mean(s * s)))
+                        band_db[i] = 20.0 * np.log10(rms + 1e-7)
+
+                    # More sensitive mapping => more visible movement on quiet inputs
+                    db_min = -90.0
+                    db_max = -25.0
+                    new_norm = (band_db - db_min) / (db_max - db_min)
+                    new_norm = np.clip(new_norm, 0.0, 1.0).astype(np.float32)
+
+                    # Attack/release smoothing
+                    if self._ema is None or self._ema.shape != new_norm.shape:
+                        self._ema = new_norm
+                    else:
+                        up = new_norm > self._ema
+                        self._ema = np.where(up, 0.30 * self._ema + 0.70 * new_norm, 0.70 * self._ema + 0.30 * new_norm).astype(np.float32)
+                except Exception:
+                    pass
+
+            if self._ema is None:
+                self._ema = np.zeros(self._bars, dtype=np.float32)
+            elif stale and not chunks:
+                # decay slowly when no recent audio
+                try:
+                    self._ema = (0.95 * self._ema).astype(np.float32)
+                except Exception:
+                    pass
+
+            try:
+                with self._lock:
+                    self._latest_norm = self._ema.copy()
+            except Exception:
+                pass
+
+            try:
+                time.sleep(interval)
+            except Exception:
+                pass
+
+    def _rebuild(self):
+        try:
+            self.canvas.delete("all")
+        except Exception:
+            pass
+        self._rects = []
+
+        w = max(1, self.canvas.winfo_width())
+        h = max(1, self.canvas.winfo_height())
+        try:
+            self.canvas.config(bg="black")
+        except Exception:
+            pass
+
+        for i in range(self._bars):
+            x0 = int(i * w / max(1, self._bars))
+            x1 = int((i + 1) * w / max(1, self._bars))
+            rid = self.canvas.create_rectangle(x0, h, x1, h, fill="green", outline="")
+            self._rects.append(rid)
+
+    def _tick(self):
+        if not self._running:
+            return
+
+        try:
+            w = max(1, self.canvas.winfo_width())
+            h = max(1, self.canvas.winfo_height())
+
+            with self._lock:
+                norm = self._latest_norm.copy() if self._latest_norm is not None else None
+
+                if norm is not None:
+                    for i, rid in enumerate(self._rects):
+                        x0 = int(i * w / max(1, self._bars))
+                        x1 = int((i + 1) * w / max(1, self._bars))
+                        v = float(norm[i])
+                        bar_h = int(v * (h - 2))
+                        self.canvas.coords(rid, x0, h, x1, max(0, h - bar_h))
+                        try:
+                            if v < 0.60:
+                                c = "green"
+                            elif v < 0.85:
+                                c = "yellow"
+                            else:
+                                c = "red"
+                            self.canvas.itemconfig(rid, fill=c)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        self._after_id = self.after(self._update_ms, self._tick)
+
 
 class App(tk.Tk):
     def __init__(self, simulate_automation: bool = False):
@@ -70,6 +379,8 @@ class App(tk.Tk):
         # Set up the main window (kept hidden until splash is closed)
         self.title("VAICCS (Beta)")
         self.geometry("900x850")
+
+        # Use default Tk theme/colors (no light/dark overrides)
 
         # Replace the default Tk icon (feather) with bundled `icon.ico` if available
         try:
@@ -127,9 +438,15 @@ class App(tk.Tk):
                 pass
 
         # Menubar: File / View / Help
-        menubar = tk.Menu(self)
+        try:
+            menubar = tk.Menu(self, background=getattr(self, '_frame_bg', None), foreground=getattr(self, '_fg_color', None), activebackground=getattr(self, '_select_bg', None), activeforeground=getattr(self, '_fg_color', None))
+        except Exception:
+            menubar = tk.Menu(self)
 
-        file_menu = tk.Menu(menubar, tearoff=0)
+        try:
+            file_menu = tk.Menu(menubar, tearoff=0, background=getattr(self, '_frame_bg', None), foreground=getattr(self, '_fg_color', None), activebackground=getattr(self, '_select_bg', None), activeforeground=getattr(self, '_fg_color', None))
+        except Exception:
+            file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Save Settings", accelerator="Ctrl+S", command=lambda: self._on_save_clicked())
         file_menu.add_command(label="Save Settings As...", accelerator="Ctrl+Shift+S", command=lambda: self._on_save_as())
         file_menu.add_command(label="Options...", command=lambda: self._open_options_dialog())
@@ -170,30 +487,39 @@ class App(tk.Tk):
         self.noise_enabled_var = tk.BooleanVar(value=False)
 
         # Models menu: Vosk models + future Hance models placeholder
-        models_menu = tk.Menu(menubar, tearoff=0)
+        try:
+            models_menu = tk.Menu(menubar, tearoff=0, background=getattr(self, '_frame_bg', None), foreground=getattr(self, '_fg_color', None), activebackground=getattr(self, '_select_bg', None), activeforeground=getattr(self, '_fg_color', None))
+        except Exception:
+            models_menu = tk.Menu(menubar, tearoff=0)
         models_menu.add_command(label="Vosk Models...", command=lambda: self._open_vosk_model_manager())
         # Placeholder entry for future Hance models manager
         models_menu.add_command(label="Hance Models...", command=lambda: self._open_hance_model_manager())
         menubar.add_cascade(label="Models", menu=models_menu)
 
-        view_menu = tk.Menu(menubar, tearoff=0)
+        try:
+            view_menu = tk.Menu(menubar, tearoff=0, background=getattr(self, '_frame_bg', None), foreground=getattr(self, '_fg_color', None), activebackground=getattr(self, '_select_bg', None), activeforeground=getattr(self, '_fg_color', None))
+        except Exception:
+            view_menu = tk.Menu(menubar, tearoff=0)
         # Auto-scroll menu item bound to the shared variable
         view_menu.add_checkbutton(label="Auto-scroll", variable=self.auto_scroll_var)
         view_menu.add_command(label="Jump to latest", command=self._jump_to_latest)
         menubar.add_cascade(label="View", menu=view_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
+        try:
+            help_menu = tk.Menu(menubar, tearoff=0, background=getattr(self, '_frame_bg', None), foreground=getattr(self, '_fg_color', None), activebackground=getattr(self, '_select_bg', None), activeforeground=getattr(self, '_fg_color', None))
+        except Exception:
+            help_menu = tk.Menu(menubar, tearoff=0)
         # Activate dialog (personal free / commercial paid). Placeholder UI.
         help_menu.add_command(label="Activate", command=lambda: self._open_activate())
         help_menu.add_command(label="Check for Updates...", command=lambda: self._check_for_updates(manual=True))
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About",
-                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2025 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
+                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2026 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         try:
+            # Always use the native menubar (default Tk behavior)
             self.config(menu=menubar)
         except Exception:
-            # some tkinter variants may not support menu on this platform
             pass
 
         # Keyboard shortcuts
@@ -467,15 +793,89 @@ class App(tk.Tk):
         # Transcript area with vertical scrollbar
         trans_frame = ttk.Frame(left)
         trans_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.transcript = tk.Text(trans_frame, wrap=tk.WORD)
+        self.transcript = tk.Text(
+            trans_frame,
+            wrap=tk.WORD,
+            bg=getattr(self, '_text_bg', 'white'),
+            fg=getattr(self, '_text_fg', 'black'),
+            insertbackground=getattr(self, '_text_fg', 'black')
+        )
         self.transcript.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.transcript_scroll = ttk.Scrollbar(trans_frame, orient=tk.VERTICAL, command=self.transcript.yview)
         self.transcript_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.transcript.config(yscrollcommand=self.transcript_scroll.set)
 
-        # Right: controls (1/4)
-        right = ttk.Frame(self.main_frame, width=250)
-        right.pack(side=tk.RIGHT, fill=tk.Y)
+        # Right: controls (1/4) -- make scrollable when content exceeds height
+        right_container = ttk.Frame(self.main_frame, width=250)
+        right_container.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Canvas + scrollbar to enable vertical scrolling of the right-side controls
+        right_canvas = tk.Canvas(right_container, borderwidth=0, highlightthickness=0)
+        right_vscroll = ttk.Scrollbar(right_container, orient=tk.VERTICAL, command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_vscroll.set)
+
+        right_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Inner frame that will hold the controls; this is the frame referenced as `right`
+        right = ttk.Frame(right_canvas)
+        # Create a window on the canvas to host the `right` frame
+        right_window = right_canvas.create_window((0, 0), window=right, anchor='nw')
+
+        # Ensure the canvas scrollregion is updated when the inner frame changes size
+        def _on_right_configure(event=None):
+            try:
+                right_canvas.configure(scrollregion=right_canvas.bbox('all'))
+            except Exception:
+                pass
+
+        right.bind('<Configure>', _on_right_configure)
+
+        # Keep inner frame width in sync with the canvas width when the canvas resizes
+        def _on_canvas_configure(event):
+            try:
+                # set the inner frame width to the canvas width
+                canvas_width = event.width
+                right_canvas.itemconfig(right_window, width=canvas_width)
+            except Exception:
+                pass
+
+        right_canvas.bind('<Configure>', _on_canvas_configure)
+
+        # Mouse wheel support: platform-specific handling (Windows uses <MouseWheel>)
+        def _on_mousewheel(event):
+            try:
+                # Windows: event.delta is multiple of 120
+                if event.delta:
+                    # scroll by lines (units)
+                    right_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+                else:
+                    # fallback for other platforms (Button-4/Button-5)
+                    pass
+            except Exception:
+                pass
+
+        def _on_button4(event):
+            try:
+                right_canvas.yview_scroll(-1, 'units')
+            except Exception:
+                pass
+
+        def _on_button5(event):
+            try:
+                right_canvas.yview_scroll(1, 'units')
+            except Exception:
+                pass
+
+        # Bind wheel events when mouse is over the right_container/canvas
+        try:
+            right_canvas.bind('<Enter>', lambda e: right_canvas.bind_all('<MouseWheel>', _on_mousewheel))
+            right_canvas.bind('<Leave>', lambda e: right_canvas.unbind_all('<MouseWheel>'))
+            # Linux scroll
+            right_canvas.bind('<Button-4>', _on_button4)
+            right_canvas.bind('<Button-5>', _on_button5)
+        except Exception:
+            pass
 
         self.start_btn = ttk.Button(right, text="Start", command=self.start_capture)
         self.start_btn.pack(pady=(20, 6), padx=8, fill=tk.X)
@@ -555,6 +955,14 @@ class App(tk.Tk):
         
 
         ttk.Label(right, text="Audio Input:").pack(pady=(20, 6), padx=8, anchor=tk.W)
+
+        # Audio frequency visualizer (between label and device dropdown)
+        try:
+            self.audio_viz = AudioFrequencyVisualizer(right, height=44, bars=32, update_ms=16)
+            self.audio_viz.pack(padx=8, fill=tk.X, pady=(0, 6))
+        except Exception:
+            self.audio_viz = None
+
         self.device_var = tk.StringVar()
         self.device_combo = ttk.Combobox(right, textvariable=self.device_var, state="readonly")
         self.device_combo.pack(padx=8, fill=tk.X)
@@ -767,6 +1175,8 @@ class App(tk.Tk):
             self.transcript_scroll.bind('<B1-Motion>', self._on_user_scroll)
         except Exception:
             pass
+
+    # Theme support removed: use system/default Tk theme and colors
 
     def _populate_serial_ports(self):
         ports = []
@@ -4354,6 +4764,14 @@ class App(tk.Tk):
                 self.device_combo.config(state=tk.DISABLED)
             except Exception:
                 pass
+
+            # Attach audio monitor hook for visualizer (uses same audio stream as engine)
+            try:
+                if getattr(self, 'audio_viz', None) is not None and np is not None:
+                    mainmod.AUDIO_MONITOR = self.audio_viz.on_audio
+                    self.audio_viz.start()
+            except Exception:
+                pass
             try:
                 self._log_button_states("engine started (_on_started)")
             except Exception:
@@ -4463,6 +4881,19 @@ class App(tk.Tk):
                 self.engine.stop()
             except Exception:
                 pass
+
+        # Detach visualizer hook
+        try:
+            if getattr(mainmod, 'AUDIO_MONITOR', None) is not None:
+                mainmod.AUDIO_MONITOR = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'audio_viz', None) is not None:
+                self.audio_viz.stop()
+        except Exception:
+            pass
+
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.device_combo.config(state="readonly")
@@ -4483,6 +4914,19 @@ class App(tk.Tk):
                         self.engine.stop()
                 except Exception:
                     pass
+
+                # Detach visualizer hook on error
+                try:
+                    if getattr(mainmod, 'AUDIO_MONITOR', None) is not None:
+                        mainmod.AUDIO_MONITOR = None
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, 'audio_viz', None) is not None:
+                        self.audio_viz.stop()
+                except Exception:
+                    pass
+
                 self.start_btn.config(state=tk.NORMAL)
                 self.stop_btn.config(state=tk.DISABLED)
                 self.device_combo.config(state="readonly")

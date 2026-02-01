@@ -14,16 +14,25 @@ try:
 except Exception:
     np = None
 try:
-    from punctuator import Punctuator
+    try:
+        # Prefer a fixed local implementation if present
+        from punctuator import Punctuator
+    except Exception:
+        from punctuator import Punctuator
 except Exception:
     Punctuator = None
 
 # Application version. Update this when creating releases.
-__version__ = "1.0b2"
+__version__ = "1.0b5"
 
 # Configuration
 DEFAULT_MODEL_PATH = "model"
 SAMPLE_RATE = 16000
+
+# Optional audio monitor hook (used by GUI for visualization).
+# Signature: fn(mono_int16: "np.ndarray", samplerate: int) -> None
+# Must be fast and non-blocking; it is called from the sounddevice callback thread.
+AUDIO_MONITOR = None
 
 
 def _resource_path(relpath: str) -> str:
@@ -208,6 +217,15 @@ def callback(indata, frames, time, status):
                 mono = indata.mean(axis=1).astype('int16')
             else:
                 mono = indata.reshape(-1).astype('int16')
+
+            # Best-effort: emit samples to optional monitor hook.
+            try:
+                mon = globals().get('AUDIO_MONITOR', None)
+                if mon is not None:
+                    mon(mono, SAMPLE_RATE)
+            except Exception:
+                pass
+
             q.put(mono.tobytes())
             return
         except Exception:
@@ -278,13 +296,30 @@ class CaptionEngine:
         # buffer for raw audio bytes corresponding to the current utterance
         self._chunk_buffer = bytearray()
         # punctuator: optional path or model spec (e.g., 'hf:your-model-id')
+        # Defer heavy punctuator initialization (may download HF models)
+        # to `start()` so the GUI can show a loading dialog while it runs.
+        self._punctuator_path = punctuator
+        self._punctuator = None
+        self._punctuator_init_error = None
+
+    def _init_punctuator(self):
         try:
-            if Punctuator is not None:
-                self._punctuator = Punctuator.from_path(punctuator)
-            else:
+            if Punctuator is None:
                 self._punctuator = None
-        except Exception:
+                return
+            self._punctuator = Punctuator.from_path(self._punctuator_path)
+            # propagate init_error if present
+            try:
+                self._punctuator_init_error = getattr(self._punctuator, 'init_error', None)
+            except Exception:
+                self._punctuator_init_error = None
+        except Exception as e:
             self._punctuator = None
+            try:
+                import traceback as _tb
+                self._punctuator_init_error = _tb.format_exc()
+            except Exception:
+                self._punctuator_init_error = str(e)
 
     def _init_recognizer(self):
         # Determine whether to use recognizer
@@ -472,6 +507,12 @@ class CaptionEngine:
         _ensure_bad_words()
         self._callback = callback
         self._stop_event.clear()
+        # Initialize punctuator here (runs in engine.start thread when called
+        # from GUI's _start_engine_async) so downloads happen off the main thread
+        try:
+            self._init_punctuator()
+        except Exception:
+            pass
         self._init_recognizer()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
