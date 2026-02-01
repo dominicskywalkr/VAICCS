@@ -19,3 +19,21 @@ VAICCS 1.0 Beta 3
 - Added multiple highlighter color options
 - Adjusted default main window size 
 - Compiled using Python 3.13.11
+
+VAICCS 1.0 Beta 4
+
+- Changed copyright year to 2026
+- Added scroll functionality to the list of options shown in the main tab if the window height is to small
+- Introduced VAICCS to MacOS and made backend code fixes to get it to work on MacOS (MacOS High Sierra and newer)
+- Changed the keyboard shortcuts to be MacOS compliant. (Changing Ctrl to Command for basic functions)
+- Model, Voice Profiles and Custom Words folders are saved in the user's documents folder (currently MacOS only)
+- Added Frequency Visualizer to the main tab (MacOS only)
+- Changed Autostart behavior for the MacOS version. 
+
+VAICCS 1.0 Beta 5
+
+- Added Frequency Visualizer to the main tab (Now on Windows and MacOS).
+- When updating VAICCS, the program will automatically close after the program is done downloading, and the user selects to run the installer.
+- Renamed Windows install file to differentiate from the Mac version.
+- VAICCS will look for the changed install file. 
+- Changed compile tags to get the Mac version to work on M-series Macs (more testing needed). 
