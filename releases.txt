@@ -37,3 +37,12 @@ VAICCS 1.0 Beta 5
 - Renamed Windows install file to differentiate from the Mac version.
 - VAICCS will look for the changed install file. 
 - Changed compile tags to get the Mac version to work on M-series Macs (more testing needed). 
+
+VAICCS 1.0 Beta 6
+
+- Added website to the About page
+- Compiled using Python 3.13.17 
+- Added Nvidia GPU Support (Windows only)
+- Update Hance Models page 
+- Fixed the Audio Visualizer when Noise canelation is enabled
+- Fixed Sound inputs to be able to select your computers speakers and other outputs

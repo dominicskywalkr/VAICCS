@@ -23,7 +23,7 @@ except Exception:
     Punctuator = None
 
 # Application version. Update this when creating releases.
-__version__ = "1.0b5"
+__version__ = "1.0b6"
 
 # Configuration
 DEFAULT_MODEL_PATH = "model"
@@ -231,9 +231,18 @@ def callback(indata, frames, time, status):
         except Exception:
             pass
 
-    # Fallback for RawInputStream or unexpected types: push raw bytes
+    # Noise-cancellation wrappers pass processed int16 audio as bytes.
     try:
-        q.put(bytes(indata))
+        data = bytes(indata)
+        if np is not None and data:
+            try:
+                mono = np.frombuffer(data, dtype=np.int16)
+                mon = globals().get('AUDIO_MONITOR', None)
+                if mon is not None:
+                    mon(mono, SAMPLE_RATE)
+            except Exception:
+                pass
+        q.put(data)
     except Exception:
         # Last-resort: ignore this chunk
         return
@@ -267,11 +276,14 @@ class CaptionEngine:
     callback signature: fn(text: str)
     """
 
-    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, demo: bool = False, source: str = "mic", cpu_threads: Optional[int] = None, voice_profiles_dir: Optional[str] = "voice_profiles", profile_match_threshold: float = 0.7, enable_profile_matching: bool = True, punctuator: Optional[str] = None):
+    def __init__(self, model_path: str = DEFAULT_MODEL_PATH, demo: bool = False, source: str = "mic", cpu_threads: Optional[int] = None, voice_profiles_dir: Optional[str] = "voice_profiles", profile_match_threshold: float = 0.7, enable_profile_matching: bool = True, punctuator: Optional[str] = None, use_cuda: bool = False, device: Optional[str | int] = None, channels: int = 1):
         self.model_path = model_path
         self.demo = demo
         self.source = source
+        self.device = device
+        self.channels = max(2, int(channels)) if source == 'system' else max(1, int(channels))
         self.cpu_threads = cpu_threads
+        self.use_cuda = bool(use_cuda)
         # voice profile matching
         self.enable_profile_matching = bool(enable_profile_matching)
         self.profile_match_threshold = float(profile_match_threshold)
@@ -289,6 +301,7 @@ class CaptionEngine:
         self._recognizer = None
         self._model = None
         self._using_gpu = False
+        self._gpu_init_error = None
         # lock to protect recognizer replacement at runtime
         self._rec_lock = threading.Lock()
         # optional runtime vocabulary (list of words) used to bias decoding
@@ -321,6 +334,62 @@ class CaptionEngine:
             except Exception:
                 self._punctuator_init_error = str(e)
 
+    def _init_vosk_gpu(self, vosk_module=None):
+        """Initialize the Vosk CUDA runtime before loading the model.
+
+        Vosk only exposes GPU initialization hooks in the Python API
+        (GpuInit and GpuThreadInit). If the native Vosk backend supports it,
+        this allows the model to be allocated in GPU memory rather than
+        remaining only in system RAM.
+        """
+        if not self.use_cuda:
+            self._using_gpu = False
+            self._gpu_init_error = None
+            return False
+        try:
+            if vosk_module is None:
+                try:
+                    import vosk as vosk_module
+                except Exception:
+                    vosk_module = None
+            if vosk_module is None:
+                self._using_gpu = False
+                self._gpu_init_error = "Vosk module unavailable"
+                return False
+            if hasattr(vosk_module, "GpuInit"):
+                try:
+                    vosk_module.GpuInit()
+                except Exception as exc:
+                    self._using_gpu = False
+                    self._gpu_init_error = str(exc)
+                    try:
+                        print(f"CUDA initialization failed: {self._gpu_init_error}", file=sys.stderr)
+                    except Exception:
+                        pass
+                    return False
+            if hasattr(vosk_module, "GpuThreadInit"):
+                try:
+                    vosk_module.GpuThreadInit()
+                except Exception as exc:
+                    self._using_gpu = False
+                    self._gpu_init_error = str(exc)
+                    try:
+                        print(f"CUDA thread init failed: {self._gpu_init_error}", file=sys.stderr)
+                    except Exception:
+                        pass
+                    return False
+            self._using_gpu = True
+            self._gpu_init_error = None
+            return True
+        except Exception as exc:
+            self._using_gpu = False
+            self._gpu_init_error = str(exc)
+            try:
+                print(f"CUDA requested but falling back to CPU: {self._gpu_init_error}", file=sys.stderr)
+            except Exception:
+                pass
+            return False
+
     def _init_recognizer(self):
         # Determine whether to use recognizer
         # If cpu_threads specified, set environment variables before importing Vosk/Kaldi
@@ -339,7 +408,9 @@ class CaptionEngine:
             self._recognizer = None
             return
         # Delay import of vosk until after we set thread env vars
+        vosk_module = None
         try:
+            import vosk as vosk_module
             from vosk import Model, KaldiRecognizer
         except Exception as e:
             # Attempt to record the full traceback so frozen executables can surface
@@ -396,6 +467,15 @@ class CaptionEngine:
             self.demo = True
             return
 
+        gpu_init_ok = self._init_vosk_gpu(vosk_module)
+        if self.use_cuda and not gpu_init_ok:
+            self._using_gpu = False
+            self.use_cuda = False
+            try:
+                print(f"Falling back to CPU because CUDA could not be initialized: {self._gpu_init_error}", file=sys.stderr)
+            except Exception:
+                pass
+
         if not os.path.exists(self.model_path):
             self._recognizer = None
             self._model = None
@@ -431,22 +511,43 @@ class CaptionEngine:
                         # extraction failed; fall back to original path and continue
                         model_dir = self.model_path
 
-            self._model = Model(model_dir)
-            # If a runtime vocabulary was configured, pass it as grammar to KaldiRecognizer
-            try:
-                if self._current_vocab:
-                    import json as _json
-                    grammar = _json.dumps(self._current_vocab)
-                    self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, grammar)
-                else:
-                    self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
-            except Exception:
-                # fallback to simple recognizer creation
-                self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
-            try:
-                self._recognizer.SetWords(True)
-            except Exception:
-                pass
+            requested_cuda = bool(self.use_cuda)
+            for attempt in range(2):
+                try:
+                    if attempt == 1 and requested_cuda and self.use_cuda:
+                        self.use_cuda = False
+                        self._using_gpu = False
+                        self._gpu_init_error = self._gpu_init_error or "Falling back to CPU because CUDA initialization did not produce a usable recognizer"
+                    self._model = Model(model_dir)
+                    # If a runtime vocabulary was configured, pass it as grammar to KaldiRecognizer
+                    try:
+                        if self._current_vocab:
+                            import json as _json
+                            grammar = _json.dumps(self._current_vocab)
+                            self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, grammar)
+                        else:
+                            self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
+                    except Exception:
+                        # fallback to simple recognizer creation
+                        self._recognizer = KaldiRecognizer(self._model, SAMPLE_RATE)
+                    try:
+                        self._recognizer.SetWords(True)
+                    except Exception:
+                        pass
+                    break
+                except Exception as exc:
+                    if attempt == 0 and requested_cuda and self.use_cuda:
+                        self._using_gpu = False
+                        self._gpu_init_error = str(exc)
+                        try:
+                            print(f"CUDA requested but falling back to CPU: {self._gpu_init_error}", file=sys.stderr)
+                        except Exception:
+                            pass
+                        continue
+                    self._recognizer = None
+                    self._model = None
+                    self.demo = True
+                    break
         except Exception:
             self._recognizer = None
             self._model = None
@@ -543,28 +644,33 @@ class CaptionEngine:
             # queue.Empty or other minor issues; safe to continue
             pass
         # build stream kwargs
-        stream_kwargs = dict(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16', channels=1, callback=callback)
-        use_raw = False
-        if np is None:
-            use_raw = True
-        if self.source == 'system' and hasattr(sd, 'WasapiSettings'):
+        stream_kwargs = dict(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16', channels=self.channels, callback=callback)
+        if self.source == 'system':
             try:
-                wasapi = sd.WasapiSettings(loopback=True)
-                stream_kwargs['extra_settings'] = wasapi
-                stream_kwargs['channels'] = 2
-            except Exception:
-                pass
-
-        try:
-            if use_raw:
-                stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=8000, dtype='int16', channels=stream_kwargs.get('channels', 1), callback=callback, **({'extra_settings': stream_kwargs['extra_settings']} if 'extra_settings' in stream_kwargs else {}))
+                import soundcard as sc
+            except ImportError as exc:
+                raise RuntimeError('Speaker loopback requires the soundcard package.') from exc
+            if np is None:
+                raise RuntimeError('Speaker loopback requires NumPy.')
+            microphone = sc.get_microphone(id=self.device, include_loopback=True)
+            stream = microphone.recorder(samplerate=SAMPLE_RATE, channels=self.channels, blocksize=8000)
+        else:
+            if self.device is not None:
+                stream_kwargs['device'] = self.device
+            if np is None:
+                stream = sd.RawInputStream(**stream_kwargs)
             else:
                 stream = sd.InputStream(**stream_kwargs)
 
+        try:
             with stream:
                 start_time = datetime.datetime.now()
                 caption_index = 1
                 while not self._stop_event.is_set():
+                    if self.source == 'system':
+                        audio = stream.record(numframes=8000)
+                        audio = np.clip(audio * 32767, -32768, 32767).astype('int16')
+                        callback(audio, len(audio), None, None)
                     try:
                         data = q.get(timeout=0.5)
                     except Exception:
@@ -673,9 +779,10 @@ if __name__ == "__main__":
     parser.add_argument("--demo", action="store_true", help="Run in demo mode without a Vosk model")
     parser.add_argument("--source", "-s", choices=("mic", "system"), default="mic",
                         help="Audio source: 'mic' for default microphone, 'system' for internal computer sound (loopback, Windows WASAPI)")
+    parser.add_argument("--use-cuda", action="store_true", help="Enable NVIDIA CUDA acceleration for Vosk if available")
     args = parser.parse_args()
 
-    engine = CaptionEngine(model_path=args.model, demo=args.demo, source=args.source)
+    engine = CaptionEngine(model_path=args.model, demo=args.demo, source=args.source, use_cuda=args.use_cuda)
 
     try:
         print("🎙️ Streaming captions... Press Ctrl+C to stop.")

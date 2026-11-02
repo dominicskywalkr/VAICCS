@@ -23,11 +23,11 @@ def _human_size(bytesize: int) -> str:
 
 def parse_hance_models():
     """Return a mapping of 'Hance Models' -> list of model dicts found in
-    the GitHub repository `hance-engine/hance-api` under `Models/`.
+    the GitHub repository `BenedictRaymond/hance-api` under `Models/`.
 
     Uses the GitHub git/trees API to recursively find files under Models/.
     """
-    owner = 'hance-engine'
+    owner = 'BenedictRaymond'
     repo = 'hance-api'
     branch = 'main'
     api_tree = f'https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1'

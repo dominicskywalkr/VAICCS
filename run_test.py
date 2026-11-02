@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Simple test runner for headless tests.
 
-Finds files named test_*.py in the repository root (excluding common build dirs) and
+Finds files named test_*.py in the test folder and
 executes each with the same Python interpreter. Captures stdout/stderr and exit code
 and prints a concise per-test report plus a summary.
 
 Usage:
   python run_test.py            # runs all test_*.py files
-  python run_test.py test_a.py  # run a single test file or a list of files
+    python run_test.py test/test_a.py  # run a single test file or a list of files
 
 This runner purposely invokes each test as a subprocess so tests that are not
 unittest-style (ad-hoc scripts) will still run and report their exit codes.
@@ -26,9 +26,9 @@ BASE = os.path.abspath(os.path.dirname(__file__))
 
 
 def find_tests(pattern: str = "test_*.py") -> List[str]:
-    # search top-level only to avoid running deeper library tests/built artifacts
+    # Search only the project test folder, avoiding library and build tests.
     files = []
-    for p in glob.glob(os.path.join(BASE, pattern)):
+    for p in glob.glob(os.path.join(BASE, "test", pattern)):
         # exclude build folders explicitly if file paths contain them
         if any(part in p.replace('\\', '/') for part in ('build/', 'dist/', '__pycache__')):
             continue
@@ -39,8 +39,11 @@ def find_tests(pattern: str = "test_*.py") -> List[str]:
 
 def run_test(path: str, timeout: float = 60.0) -> dict:
     cmd = [sys.executable, path]
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (BASE, pythonpath)))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=BASE, env=env)
         ret = {
             "path": path,
             "returncode": proc.returncode,
@@ -103,12 +106,17 @@ def main(argv: List[str] | None = None) -> int:
 
     if argv:
         # explicit list of test files
-        tests = [os.path.abspath(p) for p in argv]
+        tests = []
+        for path in argv:
+            resolved = path if os.path.isabs(path) else os.path.join(BASE, path)
+            if not os.path.isfile(resolved):
+                resolved = os.path.join(BASE, "test", path)
+            tests.append(os.path.abspath(resolved))
     else:
         tests = find_tests()
 
     if not tests:
-        print("No test_*.py files found in the repository root.")
+        print("No test_*.py files found in the test folder.")
         return 0
 
     results = []

@@ -1,4 +1,5 @@
 import os
+import importlib
 import json
 import base64
 import zipfile
@@ -17,6 +18,7 @@ import subprocess
 import datetime
 import time
 import re
+from typing import Any, cast
 from collections import deque
 from urllib.parse import quote, urlparse
 from main import CaptionEngine
@@ -513,7 +515,7 @@ class App(tk.Tk):
         help_menu.add_command(label="Activate", command=lambda: self._open_activate())
         help_menu.add_command(label="Check for Updates...", command=lambda: self._check_for_updates(manual=True))
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About",
-                                               f"VAICCS (Vosk AI Closed Captioning System)\n\nProvides live captions using Vosk (or demo mode).\n\nDeveloped by Dominic Natoli. 2026 \n\nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
+                                               f"VAICCS (Vosk AI Closed Captioning System)\nProvides live captions using Vosk (or demo mode).\nDeveloped by Natoli Technologies. 2026 \nnatolitech.net \nVersion: {getattr(mainmod, '__version__', 'unknown') }"))
         menubar.add_cascade(label="Help", menu=help_menu)
 
         try:
@@ -547,6 +549,11 @@ class App(tk.Tk):
             self._gui_settings = self._load_gui_settings()
         except Exception:
             self._gui_settings = {}
+
+        try:
+            self._gui_use_cuda_default = bool((self._gui_settings or {}).get('use_cuda', False))
+        except Exception:
+            self._gui_use_cuda_default = False
 
         try:
             # Create a BooleanVar for the auto-update preference (Options dialog will expose it)
@@ -902,12 +909,29 @@ class App(tk.Tk):
         # Model status label
         self.model_status_var = tk.StringVar(value="Model: (not selected) - Demo mode")
         ttk.Label(right, textvariable=self.model_status_var, wraplength=220).pack(padx=8, pady=(6, 0), anchor=tk.W)
+        self.gpu_status_var = tk.StringVar(value="CUDA: disabled")
+        ttk.Label(right, textvariable=self.gpu_status_var, wraplength=220, foreground="blue").pack(padx=8, pady=(2, 8), anchor=tk.W)
         # (Optional recase/punctuation UI removed - using plain Vosk model selection)
         # CPU threads control
         ttk.Label(right, text="CPU threads:").pack(pady=(8, 2), padx=8, anchor=tk.W)
         self.cpu_threads_var = tk.IntVar(value=0)
         self.cpu_threads_spin = ttk.Spinbox(right, from_=0, to=64, textvariable=self.cpu_threads_var)
         self.cpu_threads_spin.pack(padx=8, fill=tk.X)
+        ttk.Label(right, text="Vosk acceleration:").pack(pady=(8, 2), padx=8, anchor=tk.W)
+        self.use_cuda_var = tk.BooleanVar(value=getattr(self, '_gui_use_cuda_default', False))
+        self.use_cuda_chk = ttk.Checkbutton(right, text="Enable NVIDIA CUDA acceleration", variable=self.use_cuda_var)
+        self.use_cuda_chk.pack(padx=8, anchor=tk.W)
+        try:
+            self.use_cuda_var.trace_add("write", lambda *a: self._on_use_cuda_changed())
+        except Exception:
+            try:
+                self.use_cuda_var.trace("w", lambda *a: self._on_use_cuda_changed())
+            except Exception:
+                pass
+        try:
+            self._update_gpu_status()
+        except Exception:
+            pass
         # Thread status label
         self.thread_status_var = tk.StringVar(value="Threads: auto (not applied)")
         ttk.Label(right, textvariable=self.thread_status_var).pack(padx=8, pady=(4, 8), anchor=tk.W)
@@ -1155,11 +1179,43 @@ class App(tk.Tk):
     def _populate_audio_devices(self):
         try:
             devices = sd.query_devices()
-            names = [f"{i}: {d['name']}" for i, d in enumerate(devices)]
+            names = []
+            self._audio_device_map = {}
+            for i, device in enumerate(devices):
+                device_info = cast(dict[str, Any], device)
+                if int(device_info.get('max_input_channels', 0)) > 0:
+                    device_name = device_info.get('name', f'Audio device {i}')
+                    name = f"Microphone: {i}: {device_name}"
+                    names.append(name)
+                    self._audio_device_map[name] = {
+                        'device': i,
+                        'source': 'mic',
+                        'channels': 1,
+                    }
+
+            try:
+                sc = importlib.import_module('soundcard')
+                for microphone in sc.all_microphones(include_loopback=True):
+                    if not getattr(microphone, 'isloopback', False):
+                        continue
+                    available_channels = microphone.channels
+                    channel_count = available_channels if isinstance(available_channels, int) else len(available_channels)
+                    name = f"Speaker (loopback): {microphone.name}"
+                    names.append(name)
+                    self._audio_device_map[name] = {
+                        'device': microphone.id,
+                        'source': 'system',
+                        'channels': 2 if channel_count >= 2 else channel_count,
+                    }
+            except Exception:
+                pass
+
             self.device_combo['values'] = names
             if names:
-                self.device_combo.current(0)
+                first_input = next((i for i, name in enumerate(names) if name.startswith('Microphone: ')), 0)
+                self.device_combo.current(first_input)
         except Exception:
+            self._audio_device_map = {}
             self.device_combo['values'] = ["Default"]
             self.device_combo.current(0)
 
@@ -1568,12 +1624,54 @@ class App(tk.Tk):
 
     def _update_model_status(self):
         path = self.model_path_var.get().strip()
+        use_cuda = False
+        try:
+            var = getattr(self, 'use_cuda_var', None)
+            if var is not None:
+                use_cuda = bool(var.get())
+        except Exception:
+            use_cuda = False
+        suffix = " (CUDA)" if use_cuda else ""
         if path and self._is_valid_model(path):
-            self.model_status_var.set(f"Model: {os.path.basename(path)}")
+            self.model_status_var.set(f"Model: {os.path.basename(path)}{suffix}")
         elif path:
-            self.model_status_var.set(f"Model: {os.path.basename(path)} (invalid)")
+            self.model_status_var.set(f"Model: {os.path.basename(path)} (invalid){suffix}")
         else:
-            self.model_status_var.set("Model: (not selected) - Demo mode")
+            self.model_status_var.set(f"Model: (not selected) - Demo mode{suffix}")
+        try:
+            self._update_gpu_status()
+        except Exception:
+            pass
+
+    def _update_gpu_status(self):
+        try:
+            use_cuda = bool(self.use_cuda_var.get()) if getattr(self, 'use_cuda_var', None) is not None else False
+        except Exception:
+            use_cuda = False
+        status = "CUDA: disabled"
+        try:
+            engine = getattr(self, 'engine', None)
+            if engine is not None:
+                if engine.use_cuda and engine._using_gpu:
+                    status = "CUDA: enabled"
+                elif engine.use_cuda and not engine._using_gpu:
+                    err = getattr(engine, '_gpu_init_error', None)
+                    if err:
+                        status = f"CUDA requested; falling back to CPU ({err})"
+                    else:
+                        status = "CUDA requested; falling back to CPU"
+                elif use_cuda:
+                    status = "CUDA requested"
+                else:
+                    status = "CUDA: disabled"
+            else:
+                status = "CUDA requested" if use_cuda else "CUDA: disabled"
+        except Exception:
+            status = "CUDA: disabled"
+        try:
+            self.gpu_status_var.set(status)
+        except Exception:
+            pass
 
     def _on_user_scroll(self, event=None):
         """Called when the user scrolls the transcript; pause auto-scroll unless user is at bottom."""
@@ -1772,6 +1870,21 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _on_use_cuda_changed(self):
+        """Persist the user's CUDA preference and update the GPU status label."""
+        try:
+            use_cuda = bool(getattr(self, 'use_cuda_var', tk.BooleanVar(value=False)).get())
+            s = self._gui_settings or {}
+            s['use_cuda'] = use_cuda
+            self._gui_settings = s
+            self._save_gui_settings()
+        except Exception:
+            pass
+        try:
+            self._update_gpu_status()
+        except Exception:
+            pass
+
     def _maybe_auto_check_updates(self):
         try:
             s = self._gui_settings or {}
@@ -1915,7 +2028,7 @@ class App(tk.Tk):
             asset_url = None
             asset_name = None
             # Look specifically for the known installer filename first
-            desired_asset = 'VAICCS.install.AMD64.exe'
+            desired_asset = 'VAICCS.Windows.AMD64.exe'
             for a in assets:
                 name = a.get('name', '') or ''
                 if name == desired_asset:
@@ -2426,17 +2539,77 @@ class App(tk.Tk):
                             pass
 
                         def _run_installer():
+                            launched = False
                             try:
+                                try:
+                                    if status_lbl and status_lbl.winfo_exists():
+                                        status_lbl.config(text='Launching installer... VAICCS will close shortly.')
+                                except Exception:
+                                    pass
+                                try:
+                                    if run_btn and run_btn.winfo_exists():
+                                        run_btn.config(state='disabled')
+                                except Exception:
+                                    pass
+                                try:
+                                    if cancel_btn and cancel_btn.winfo_exists():
+                                        cancel_btn.config(state='disabled')
+                                except Exception:
+                                    pass
+
                                 if sys.platform.startswith('win'):
                                     os.startfile(tmp_path)
                                 else:
                                     subprocess.Popen(['chmod', '+x', tmp_path])
                                     subprocess.Popen([tmp_path])
+                                launched = True
                             except Exception:
                                 try:
                                     messagebox.showinfo('Run Installer', f'Installer saved to: {tmp_path}')
                                 except Exception:
                                     pass
+
+                            if launched:
+                                # Give the installer a moment to start, then fully close VAICCS.
+                                try:
+                                    import time
+                                    def _force_exit_later():
+                                        try:
+                                            time.sleep(10)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            os._exit(0)
+                                        except Exception:
+                                            pass
+                                    threading.Thread(target=_force_exit_later, daemon=True).start()
+                                except Exception:
+                                    pass
+
+                                try:
+                                    # Close the download dialog and quit the app after a few seconds.
+                                    def _close_app():
+                                        try:
+                                            if dlg and dlg.winfo_exists():
+                                                dlg.destroy()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            self.quit()
+                                        except Exception:
+                                            try:
+                                                os._exit(0)
+                                            except Exception:
+                                                pass
+                                    self.safe_after(3000, _close_app)
+                                except Exception:
+                                    try:
+                                        self.quit()
+                                    except Exception:
+                                        try:
+                                            os._exit(0)
+                                        except Exception:
+                                            pass
 
                         # enable run button
                         try:
@@ -2476,7 +2649,13 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+            use_cuda = False
+            try:
+                use_cuda = bool(self.use_cuda_var.get()) if getattr(self, 'use_cuda_var', None) is not None else False
+            except Exception:
+                use_cuda = False
             data = {"model_path": self.model_path_var.get().strip(), "cpu_threads": int(self.cpu_threads_var.get()),
+                    "use_cuda": use_cuda,
                     "serial_enabled": bool(self.serial_enabled_var.get()),
                     "serial_port": device_name,
                     "baud": int(self.baud_var.get()),
@@ -2699,6 +2878,10 @@ class App(tk.Tk):
                         self.punctuator_var.set(punc)
                 # recase path handling removed
                 self.cpu_threads_var.set(int(data.get("cpu_threads", 0)))
+                try:
+                    self.use_cuda_var.set(bool(data.get("use_cuda", False)))
+                except Exception:
+                    pass
                 self.serial_enabled_var.set(bool(data.get("serial_enabled", False)))
                 # profile matching settings (optional)
                 try:
@@ -4076,7 +4259,7 @@ class App(tk.Tk):
         models_tree.column('size', anchor=tk.CENTER, width=80)
         models_tree.pack(fill=tk.BOTH, expand=True, pady=(4,4))
 
-        status_var = tk.StringVar(value="Click Refresh to load models from GitHub: hance-engine/hance-api/Models")
+        status_var = tk.StringVar(value="Click Refresh to load models from GitHub: BenedictRaymond/hance-api/Models")
         ttk.Label(frm, textvariable=status_var, wraplength=500).pack(anchor=tk.W, pady=(6,4))
         # Show where models will be installed
         try:
@@ -4651,14 +4834,13 @@ class App(tk.Tk):
         t.start()
 
     def start_capture(self):
-        # set device if selected
         sel = self.device_combo.get()
-        if sel and ":" in sel:
-            idx = int(sel.split(":", 1)[0])
+        audio_device = getattr(self, '_audio_device_map', {}).get(sel, {})
+        if not audio_device and sel and ':' in sel:
             try:
-                sd.default.device = idx
-            except Exception:
-                pass
+                audio_device = {'device': int(sel.split(':', 1)[0]), 'source': 'mic', 'channels': 1}
+            except ValueError:
+                audio_device = {}
 
         try:
             self._log_button_states("start_capture entry - after device selection")
@@ -4698,10 +4880,14 @@ class App(tk.Tk):
         self.engine = CaptionEngine(
             model_path=model_path if not demo else None,
             demo=demo,
+            source=audio_device.get('source', 'mic'),
+            device=audio_device.get('device'),
+            channels=audio_device.get('channels', 1),
             cpu_threads=(cpu_threads if cpu_threads > 0 else None),
             enable_profile_matching=bool(self.profile_matching_var.get()),
             profile_match_threshold=float(self.profile_threshold_var.get()),
             punctuator=(self.punctuator_var.get().strip() if getattr(self, 'punctuator_var', None) is not None else None),
+            use_cuda=bool(self.use_cuda_var.get()) if getattr(self, 'use_cuda_var', None) is not None else False,
         )
 
         # If punctuator failed to initialize with diagnostics, surface a warning
@@ -4752,6 +4938,10 @@ class App(tk.Tk):
             # update UI now that engine thread is running
             try:
                 self._update_model_status()
+            except Exception:
+                pass
+            try:
+                self._update_gpu_status()
             except Exception:
                 pass
             try:

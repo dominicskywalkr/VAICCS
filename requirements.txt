@@ -1,6 +1,7 @@
 numpy
 librosa
 soundfile
+soundcard
 serial
 pyserial
 requests
