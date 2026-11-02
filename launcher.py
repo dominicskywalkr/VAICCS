@@ -710,6 +710,42 @@ try:
 except Exception:
     pass
 
+# Mirror INFO log lines onto the splash. Records may come from worker threads,
+# so they are queued and applied on the Tk thread.
+import queue as _queue
+_splash_log_q: "_queue.Queue[str]" = _queue.Queue()
+
+class _SplashLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            if record.levelno == logging.INFO:
+                _splash_log_q.put_nowait(record.getMessage())
+        except Exception:
+            pass
+
+_splash_log_handler = _SplashLogHandler(level=logging.INFO)
+_logger.addHandler(_splash_log_handler)
+
+def _pump_splash_log():
+    last = None
+    try:
+        while True:
+            last = _splash_log_q.get_nowait()
+    except _queue.Empty:
+        pass
+    try:
+        if last is not None:
+            splash.update_status(last)
+        root.after(100, _pump_splash_log)
+    except Exception:
+        # root/splash destroyed; stop mirroring
+        _logger.removeHandler(_splash_log_handler)
+
+try:
+    root.after(100, _pump_splash_log)
+except Exception:
+    pass
+
 # Poll for completion
 POLL_MS = 200
 

@@ -41,7 +41,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='VAICCS',
-    icon=None,
+    icon='VAICCS.icns',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -62,7 +62,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='VAICCS.app',
-    icon=None,
+    icon='VAICCS.icns',
     bundle_identifier='com.dominic.vaiccs',
     # No entitlements -> no app sandbox.
     entitlements_file=None,
@@ -90,7 +90,7 @@ debug_exe = EXE(
     [],
     exclude_binaries=True,
     name='VAICCS Debug',
-    icon=None,
+    icon='VAICCS.icns',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -111,7 +111,7 @@ debug_coll = COLLECT(
 debug_app = BUNDLE(
     debug_coll,
     name='VAICCS Debug.app',
-    icon=None,
+    icon='VAICCS.icns',
     bundle_identifier='com.dominic.vaiccs.debug',
     entitlements_file=None,
 )

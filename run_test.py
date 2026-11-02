@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Simple test runner for headless tests.
 
-Finds files named test_*.py in the repository root (excluding common build dirs) and
-executes each with the same Python interpreter. Captures stdout/stderr and exit code
-and prints a concise per-test report plus a summary.
+Finds files named test_*.py in the test directory and executes each with the same
+Python interpreter. Captures stdout/stderr and exit code and prints a concise
+per-test report plus a summary.
 
 Usage:
-  python run_test.py            # runs all test_*.py files
-  python run_test.py test_a.py  # run a single test file or a list of files
+    python run_test.py                 # runs all test_*.py files in test/
+    python run_test.py test/test_a.py  # run a single test file or a list of files
 
 This runner purposely invokes each test as a subprocess so tests that are not
 unittest-style (ad-hoc scripts) will still run and report their exit codes.
@@ -26,9 +26,9 @@ BASE = os.path.abspath(os.path.dirname(__file__))
 
 
 def find_tests(pattern: str = "test_*.py") -> List[str]:
-    # search top-level only to avoid running deeper library tests/built artifacts
+    # Search only the dedicated test directory, not built artifacts or libraries.
     files = []
-    for p in glob.glob(os.path.join(BASE, pattern)):
+    for p in glob.glob(os.path.join(BASE, "test", pattern)):
         # exclude build folders explicitly if file paths contain them
         if any(part in p.replace('\\', '/') for part in ('build/', 'dist/', '__pycache__')):
             continue
@@ -39,8 +39,11 @@ def find_tests(pattern: str = "test_*.py") -> List[str]:
 
 def run_test(path: str, timeout: float = 60.0) -> dict:
     cmd = [sys.executable, path]
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = BASE if not existing_pythonpath else BASE + os.pathsep + existing_pythonpath
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=BASE, env=env)
         ret = {
             "path": path,
             "returncode": proc.returncode,
@@ -108,7 +111,7 @@ def main(argv: List[str] | None = None) -> int:
         tests = find_tests()
 
     if not tests:
-        print("No test_*.py files found in the repository root.")
+        print("No test_*.py files found in test/.")
         return 0
 
     results = []

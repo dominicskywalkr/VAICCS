@@ -1121,17 +1121,17 @@ class App(tk.Tk):
                 chosen = env_root
             else:
                 # On macOS:
-                # - If packaged/frozen (.app), prefer a Models folder next to the executable
-                #   at <App>.app/Contents/MacOS/Models.
-                # - Otherwise (running from source), keep using the per-user VAICCS folder.
+                # Never write into the app bundle (e.g. <App>.app/Contents/...).
+                # Signed/notarized apps must be treated as read-only at runtime;
+                # modifying bundle contents will invalidate the code signature and can
+                # trigger "app is damaged/broken" on newer macOS.
+                # Use the per-user VAICCS folder for persistent data in both source and
+                # packaged builds.
                 if sys.platform == 'darwin':
-                    if getattr(sys, 'frozen', False):
-                        chosen = exe_dir
-                    else:
-                        try:
-                            chosen = resources.get_vaiccs_root()
-                        except Exception:
-                            chosen = os.path.join(os.path.expanduser('~'), 'Documents', 'VAICCS')
+                    try:
+                        chosen = resources.get_vaiccs_root()
+                    except Exception:
+                        chosen = os.path.join(os.path.expanduser('~'), 'Documents', 'VAICCS')
                 else:
                     if script_dir and not _is_under_tmp(script_dir):
                         chosen = script_dir
@@ -4257,7 +4257,7 @@ class App(tk.Tk):
         models_tree.column('size', anchor=tk.CENTER, width=80)
         models_tree.pack(fill=tk.BOTH, expand=True, pady=(4,4))
 
-        status_var = tk.StringVar(value="Click Refresh to load models from GitHub: hance-engine/hance-api/Models")
+        status_var = tk.StringVar(value="Click Refresh to load models from GitHub: https://github.com/BenedictRaymond/hance-api/tree/main/Models")
         ttk.Label(frm, textvariable=status_var, wraplength=500).pack(anchor=tk.W, pady=(6,4))
         # Show where models will be installed
         try:

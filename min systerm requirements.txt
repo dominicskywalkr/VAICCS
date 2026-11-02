@@ -9,3 +9,5 @@ Windows Server 2016
 
 4 core CPU or better
 16 GB of DDR4 RAM or faster
+
+Nvidia GPU with CUDA support for GPU acceleration
